@@ -122,12 +122,16 @@ const App: React.FC = () => {
            currentAnalysis = await analyzeMarketConditions(marketDataRef.current, strategy.name, deepseekKeyRef.current);
            setLastAnalysis(currentAnalysis);
            
-           if (currentAnalysis.recommendedAction === 'ERROR') {
-              addLog('error', 'AI', currentAnalysis.reasoning);
+           if (currentAnalysis.recommendedAction === 'ERROR' || currentAnalysis.recommendedAction === 'WAIT') {
+              if (currentAnalysis.reasoning) {
+                  // Distinguish between actual error and intentional WAIT
+                  const level = currentAnalysis.recommendedAction === 'ERROR' ? 'error' : 'info';
+                  addLog(level, 'AI', currentAnalysis.reasoning);
+              }
               updateStrategyLastRun(strategy.id);
               return;
            } else {
-              addLog('success', 'AI', `AI 分析完成，风险评分: ${currentAnalysis.riskScore}。点击顶部查看详情。`);
+              addLog('success', 'AI', `AI 分析完成，建议: ${currentAnalysis.recommendedAction} (风险评分: ${currentAnalysis.riskScore})。`);
            }
 
            // Risk Control Check
@@ -163,16 +167,26 @@ const App: React.FC = () => {
                         const marketTicker = marketDataRef.current.find(m => m.instId === pair);
                         const price = parseFloat(marketTicker?.last || '0');
                         
+                        // --- 第三层防御：代码级硬兜底 (Hard Guardrails) ---
+                        const currentRate = parseFloat(marketTicker?.fundingRate || '0');
+
+                        // Check 1: Valid Price
                         if (price <= 0) {
                              addLog('error', 'STRATEGY', `无法获取 ${pair} 的最新价格，跳过下单。`);
                              continue;
                         }
 
-                        // Calculate quantity (Coin amount for spot/simple interpretation, or Contracts depending on pair type)
-                        // For this demo, assuming standard calculation: Amount = USD Value / Price
+                        // Check 2: POSITIVE FUNDING RATE CHECK
+                        // 即使 AI 建议买入，如果当前费率 <= 0，程序强制拦截
+                        if (currentRate <= 0) {
+                             addLog('error', 'STRATEGY', `风控严重警告: AI 建议交易 ${pair}，但监测到资金费率为 ${currentRate} (非正)，强制拦截下单！`);
+                             continue;
+                        }
+
+                        // Calculate quantity
                         const quantity = (perPairUsdSize / price).toFixed(6);
 
-                        addLog('info', 'STRATEGY', `正在执行: ${action} ${pair}, 目标金额: $${perPairUsdSize.toFixed(2)} (Qty: ${quantity})`);
+                        addLog('info', 'STRATEGY', `正在执行: ${action} ${pair}, 目标金额: $${perPairUsdSize.toFixed(2)} (Qty: ${quantity}, Rate: ${currentRate})`);
 
                         // Call OKX Service
                         await okxService.placeOrder(pair, action.toLowerCase() as 'buy' | 'sell', quantity);

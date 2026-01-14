@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useRef } from 'react';
 import { LayoutDashboard, Settings, Layers, Zap, PlayCircle, List, Eye } from 'lucide-react';
 import { okxService } from './services/okxService';
@@ -7,7 +8,7 @@ import StrategyManager from './components/StrategyManager';
 import LogsPanel from './components/LogsPanel';
 import OrdersPanel from './components/OrdersPanel';
 import AnalysisModal from './components/AnalysisModal';
-import { Asset, TickerData, StrategyConfig, LogEntry, OKXConfig, AIAnalysisResult, Position } from './types';
+import { Asset, TickerData, StrategyConfig, LogEntry, OKXConfig, AIAnalysisResult, Position, Instrument } from './types';
 import { DEFAULT_STRATEGIES, MOCK_LOGS_INIT } from './constants';
 
 const App: React.FC = () => {
@@ -18,6 +19,7 @@ const App: React.FC = () => {
   const [assets, setAssets] = useState<Asset[]>([]);
   const [marketData, setMarketData] = useState<TickerData[]>([]);
   const [positions, setPositions] = useState<Position[]>([]);
+  const [instruments, setInstruments] = useState<Instrument[]>([]); // 存储合约面值信息
   const [totalEquity, setTotalEquity] = useState<number>(0);
   const [strategies, setStrategies] = useState<StrategyConfig[]>(DEFAULT_STRATEGIES);
   const [logs, setLogs] = useState<LogEntry[]>(MOCK_LOGS_INIT);
@@ -49,15 +51,18 @@ const App: React.FC = () => {
   useEffect(() => {
     okxService.setConfig(okxConfig);
     
-    // Initial fetch
-    fetchData();
-    const interval = setInterval(fetchData, 5000); // 5s refresh
+    if (okxConfig.apiKey) {
+        fetchData();
+        // Fetch instruments metadata once (contract values usually don't change often)
+        okxService.getInstruments('SWAP').then(setInstruments).catch(console.error);
+    }
+    
+    const interval = setInterval(fetchData, 5000); 
     return () => clearInterval(interval);
   }, [okxConfig]);
 
   const fetchData = async () => {
     try {
-      // Only fetch if keys are present (even partially) to avoid spamming 401s if empty
       if (!okxConfig.apiKey) return;
 
       const [newAssets, newRates, newPositions] = await Promise.all([
@@ -73,22 +78,22 @@ const App: React.FC = () => {
       setTotalEquity(equity);
     } catch (e) {
        console.error(e);
-       // Log error to UI only if it's not a common "abort" or empty config issue
        if (okxConfig.apiKey) {
          addLog('error', 'OKX', `获取数据失败: ${e instanceof Error ? e.message : '未知错误'}`);
        }
     }
   };
 
-  // Main Strategy Loop with dynamic interval
+  // Main Strategy Loop references
   const strategiesRef = useRef(strategies);
   const marketDataRef = useRef(marketData);
+  const instrumentsRef = useRef(instruments);
   const deepseekKeyRef = useRef(deepseekKey);
   const totalEquityRef = useRef(totalEquity);
 
-  // Sync refs for the loop
   useEffect(() => { strategiesRef.current = strategies; }, [strategies]);
   useEffect(() => { marketDataRef.current = marketData; }, [marketData]);
+  useEffect(() => { instrumentsRef.current = instruments; }, [instruments]);
   useEffect(() => { deepseekKeyRef.current = deepseekKey; }, [deepseekKey]);
   useEffect(() => { totalEquityRef.current = totalEquity; }, [totalEquity]);
 
@@ -96,7 +101,6 @@ const App: React.FC = () => {
     let timeoutId: NodeJS.Timeout;
 
     const runLoop = async () => {
-      // Run frequently to check if any strategy needs execution
       const activeStrats = strategiesRef.current.filter(s => s.isActive);
       
       for (const strategy of activeStrats) {
@@ -108,7 +112,7 @@ const App: React.FC = () => {
         }
       }
 
-      timeoutId = setTimeout(runLoop, 1000); // Check every second
+      timeoutId = setTimeout(runLoop, 1000); 
     };
 
     const executeStrategy = async (strategy: StrategyConfig) => {
@@ -119,12 +123,12 @@ const App: React.FC = () => {
         // 1. AI Analysis Step
         if (strategy.parameters.useAI) {
            addLog('info', 'AI', '正在请求 DeepSeek 进行市场分析...');
+           // Note: analyzeMarketConditions now contains the "Guardian" logic to block negative rates
            currentAnalysis = await analyzeMarketConditions(marketDataRef.current, strategy.name, deepseekKeyRef.current);
            setLastAnalysis(currentAnalysis);
            
            if (currentAnalysis.recommendedAction === 'ERROR' || currentAnalysis.recommendedAction === 'WAIT') {
               if (currentAnalysis.reasoning) {
-                  // Distinguish between actual error and intentional WAIT
                   const level = currentAnalysis.recommendedAction === 'ERROR' ? 'error' : 'info';
                   addLog(level, 'AI', currentAnalysis.reasoning);
               }
@@ -134,7 +138,6 @@ const App: React.FC = () => {
               addLog('success', 'AI', `AI 分析完成，建议: ${currentAnalysis.recommendedAction} (风险评分: ${currentAnalysis.riskScore})。`);
            }
 
-           // Risk Control Check
            if(currentAnalysis.riskScore > 80) {
              addLog('warning', 'STRATEGY', `检测到高风险 (${currentAnalysis.riskScore})，触发风控熔断，跳过执行。`);
              updateStrategyLastRun(strategy.id);
@@ -142,7 +145,7 @@ const App: React.FC = () => {
            }
         }
 
-        // 2. Execution Logic (Real or Simulated based on Analysis)
+        // 2. Execution Logic
         if (currentAnalysis && (currentAnalysis.recommendedAction === 'BUY' || currentAnalysis.recommendedAction === 'SELL')) {
             const action = currentAnalysis.recommendedAction;
             const pairsToTrade = currentAnalysis.suggestedPairs || [];
@@ -150,48 +153,54 @@ const App: React.FC = () => {
             if (pairsToTrade.length === 0) {
                 addLog('warning', 'STRATEGY', 'AI 建议交易但未提供具体币对，跳过执行。');
             } else {
-                // Calculate position size based on equity and allocation %
                 const allocationPct = strategy.parameters.allocationPct || 50;
                 const totalEq = totalEquityRef.current;
-                
-                // If equity is 0 (e.g. data fetch failed or empty account), use a fallback mock equity for pure simulation log visual
                 const safeEquity = totalEq > 0 ? totalEq : 10000; 
 
                 const targetUsdSize = safeEquity * (allocationPct / 100);
-                // Distribute evenly among pairs
                 const perPairUsdSize = targetUsdSize / pairsToTrade.length;
 
                 for (const pair of pairsToTrade) {
                     try {
-                        // Find current price to calculate quantity
                         const marketTicker = marketDataRef.current.find(m => m.instId === pair);
-                        const price = parseFloat(marketTicker?.last || '0');
-                        
-                        // --- 第三层防御：代码级硬兜底 (Hard Guardrails) ---
-                        const currentRate = parseFloat(marketTicker?.fundingRate || '0');
+                        const instrumentInfo = instrumentsRef.current.find(i => i.instId === pair);
 
-                        // Check 1: Valid Price
-                        if (price <= 0) {
+                        if (!marketTicker) {
                              addLog('error', 'STRATEGY', `无法获取 ${pair} 的最新价格，跳过下单。`);
                              continue;
                         }
-
-                        // Check 2: POSITIVE FUNDING RATE CHECK
-                        // 即使 AI 建议买入，如果当前费率 <= 0，程序强制拦截
-                        if (currentRate <= 0) {
-                             addLog('error', 'STRATEGY', `风控严重警告: AI 建议交易 ${pair}，但监测到资金费率为 ${currentRate} (非正)，强制拦截下单！`);
+                        
+                        if (!instrumentInfo) {
+                             addLog('error', 'STRATEGY', `无法获取 ${pair} 的合约元数据(面值)，跳过下单。请检查网络或重启。`);
                              continue;
                         }
 
-                        // Calculate quantity
-                        const quantity = (perPairUsdSize / price).toFixed(6);
+                        // --- 最终安全检查 (Final Safety Check) ---
+                        // 即使 deepseekService 已经检查过了，我们在下单前最后一刻再查一次
+                        if (parseFloat(marketTicker.fundingRate) <= 0) {
+                             addLog('error', 'STRATEGY', `[FATAL] 拦截下单：${pair} 资金费率已变为负值 (${marketTicker.fundingRate})。`);
+                             continue;
+                        }
 
-                        addLog('info', 'STRATEGY', `正在执行: ${action} ${pair}, 目标金额: $${perPairUsdSize.toFixed(2)} (Qty: ${quantity}, Rate: ${currentRate})`);
-
-                        // Call OKX Service
-                        await okxService.placeOrder(pair, action.toLowerCase() as 'buy' | 'sell', quantity);
+                        const price = parseFloat(marketTicker.last);
+                        const contractVal = parseFloat(instrumentInfo.ctVal); // e.g., 0.01 BTC
                         
-                        addLog('success', 'OKX', `订单已提交: ${pair} ${action} ${quantity}`);
+                        // --- 核心修复：计算张数 (Lots) ---
+                        // 公式：(总USDT金额 / 当前币价) = 目标币数
+                        // 张数 = 目标币数 / 每张合约面值
+                        const targetCoinAmount = perPairUsdSize / price;
+                        const lots = Math.floor(targetCoinAmount / contractVal);
+
+                        if (lots < 1) {
+                            addLog('warning', 'STRATEGY', `${pair} 资金不足以购买最小一张合约 (Min: 1, Calc: ${lots})。`);
+                            continue;
+                        }
+
+                        addLog('info', 'STRATEGY', `正在执行: ${action} ${pair}, 目标金额: $${perPairUsdSize.toFixed(2)} (Calc: ${lots} 张 @ 面值 ${contractVal})`);
+
+                        await okxService.placeOrder(pair, action.toLowerCase() as 'buy' | 'sell', lots.toString());
+                        
+                        addLog('success', 'OKX', `订单已提交: ${pair} ${action} ${lots}张`);
 
                     } catch (e) {
                         addLog('error', 'STRATEGY', `下单失败 (${pair}): ${e instanceof Error ? e.message : 'Unknown Error'}`);

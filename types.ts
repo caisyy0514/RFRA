@@ -1,3 +1,4 @@
+
 export enum ExchangeMode {
   SIMULATION = 'SIMULATION',
   REAL = 'REAL',
@@ -30,6 +31,13 @@ export interface TickerData {
   last: string;
   fundingRate: string; // Next funding rate
   ts: string;
+}
+
+export interface Instrument {
+  instId: string;
+  ctVal: string; // Contract value (e.g., "0.01" for BTC)
+  minSz: string; // Minimum order size (e.g., "1")
+  tickSz: string; // Price tick size
 }
 
 export interface LogEntry {

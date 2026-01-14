@@ -1,4 +1,5 @@
-import { OKXConfig, TickerData, Asset, Position, Order } from '../types';
+
+import { OKXConfig, TickerData, Asset, Position, Order, Instrument } from '../types';
 
 class OKXService {
   private config: OKXConfig | null = null;
@@ -48,6 +49,24 @@ class OKXService {
     }
   }
 
+  async getInstruments(instType: 'SWAP' | 'SPOT' = 'SWAP'): Promise<Instrument[]> {
+    if (!this.config?.apiKey) return [];
+    try {
+      // Fetch public instruments data to get contract values (ctVal)
+      // Endpoint: /api/v5/public/instruments
+      const data = await this.request(`/api/v5/public/instruments?instType=${instType}`);
+      return data.map((i: any) => ({
+        instId: i.instId,
+        ctVal: i.ctVal,
+        minSz: i.minSz,
+        tickSz: i.tickSz
+      }));
+    } catch (e) {
+      console.error("Failed to fetch instruments", e);
+      return [];
+    }
+  }
+
   async getFundingRates(): Promise<TickerData[]> {
     if (!this.config?.apiKey) return [];
     
@@ -60,9 +79,6 @@ class OKXService {
         const data = await this.request(`/api/v5/public/funding-rate?instId=${instId}`);
         if (data && data.length > 0) {
             // Also fetch last price for display context
-            // Optimization: In a real app, use a bulk ticker endpoint. 
-            // Here we just mock the 'last' price or fetch it if needed, but for funding rate strategies, the rate is key.
-            // Let's fetch the ticker for "last" price.
             const tickerData = await this.request(`/api/v5/market/ticker?instId=${instId}`);
             
             return {
@@ -149,7 +165,7 @@ class OKXService {
       tdMode: 'cross', // Default to cross margin
       side,
       ordType: 'market',
-      sz: amount
+      sz: amount // Must be number of contracts (integers usually) for SWAP
     };
 
     const data = await this.request('/api/v5/trade/order', 'POST', body);

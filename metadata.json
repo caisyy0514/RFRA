@@ -1,0 +1,5 @@
+{
+  "name": "QuantX - AI Crypto Trading",
+  "description": "A high-extensibility quantitative trading platform supporting OKX V5, multi-strategy configuration, and AI-driven decision making.",
+  "requestFramePermissions": []
+}

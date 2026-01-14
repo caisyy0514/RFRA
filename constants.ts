@@ -10,10 +10,10 @@ export const DEFAULT_STRATEGIES: StrategyConfig[] = [
     parameters: {
       minFundingRate: 0.0003, // 0.03% (approx 32% APY)
       minVolume24h: 10000000, // 10 Million USDT liquidity required
-      rotationThreshold: 0.0002, // New rate must be 0.02% higher than current to switch (cover fees)
+      rotationThreshold: 0.0002, // New rate must be 0.02% higher than current to switch
       exitThreshold: 0.0001, // Exit if rate drops below 0.01%
-      allocationPct: 50, // Use 50% of available equity
-      maxPositions: 1, // Focus on the single best yielder for this demo
+      allocationPct: 30, // Each position uses 30% of total equity (Spot buy amount)
+      maxPositions: 3, // Support up to 3 positions
       useAI: true,
       scanInterval: 60, // 1 minute
     },

@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useRef } from 'react';
 import { LayoutDashboard, Settings, Layers, Zap, PlayCircle, List, Eye } from 'lucide-react';
 import { okxService } from './services/okxService';
@@ -23,7 +22,6 @@ const App: React.FC = () => {
   const [lastAnalysis, setLastAnalysis] = useState<AIAnalysisResult | null>(null);
   const [isAnalysisModalOpen, setIsAnalysisModalOpen] = useState(false);
   
-  const [deepseekKey, setDeepseekKey] = useState('');
   const [okxConfig, setOkxConfig] = useState<OKXConfig>({
     apiKey: '',
     secretKey: '',
@@ -81,13 +79,11 @@ const App: React.FC = () => {
   const strategiesRef = useRef(strategies);
   const positionsRef = useRef(positions);
   const instrumentsRef = useRef(instruments);
-  const deepseekKeyRef = useRef(deepseekKey);
   const totalEquityRef = useRef(totalEquity);
 
   useEffect(() => { strategiesRef.current = strategies; }, [strategies]);
   useEffect(() => { positionsRef.current = positions; }, [positions]);
   useEffect(() => { instrumentsRef.current = instruments; }, [instruments]);
-  useEffect(() => { deepseekKeyRef.current = deepseekKey; }, [deepseekKey]);
   useEffect(() => { totalEquityRef.current = totalEquity; }, [totalEquity]);
 
   useEffect(() => {
@@ -98,110 +94,111 @@ const App: React.FC = () => {
         const scanInterval = (strategy.parameters.scanInterval || 60) * 1000;
         const timeSinceLastRun = Date.now() - (strategy.lastRun || 0);
         if (timeSinceLastRun >= scanInterval) {
-           await executeOptimizedStrategy(strategy);
+           await executeMultiAssetStrategy(strategy);
         }
       }
-      timeoutId = setTimeout(runLoop, 1000); 
+      timeoutId = setTimeout(runLoop, 2000); 
     };
 
-    const executeOptimizedStrategy = async (strategy: StrategyConfig) => {
-        addLog('info', 'STRATEGY', `[Cycle Start] 执行策略: ${strategy.name}`);
-        addLog('info', 'STRATEGY', '正在扫描全市场合约及资金费率...');
+    const executeMultiAssetStrategy = async (strategy: StrategyConfig) => {
+        addLog('info', 'STRATEGY', `[引擎轮询] 开始扫描组合目标...`);
         
         const allTickers = await okxService.getMarketTickers();
         const minVol = strategy.parameters.minVolume24h || 10000000;
-        // CRITICAL FIX: Use volUsdt24h (calculated USDT turnover) for filtering
-        const liquidTickers = allTickers.filter(t => 
+        const minRate = strategy.parameters.minFundingRate || 0.0003;
+        
+        const validTickers = allTickers.filter(t => 
             t.instId.endsWith('-USDT-SWAP') && 
             parseFloat(t.volUsdt24h) > minVol
         );
 
-        if (liquidTickers.length === 0) {
+        if (validTickers.length === 0) {
             addLog('warning', 'STRATEGY', '市场流动性不足，未找到满足成交额要求的币种。');
             updateStrategyLastRun(strategy.id);
             return;
         }
 
-        const candidatesToCheck = liquidTickers
+        const candidateBatch = validTickers
             .sort((a, b) => parseFloat(b.volUsdt24h) - parseFloat(a.volUsdt24h))
             .slice(0, 30);
         
-        const candidatesWithRates: TickerData[] = [];
-        for (const cand of candidatesToCheck) {
+        const candidateData: TickerData[] = [];
+        for (const cand of candidateBatch) {
             const rate = await okxService.getFundingRate(cand.instId);
-            candidatesWithRates.push({ ...cand, fundingRate: rate });
+            if (parseFloat(rate) >= minRate) {
+              candidateData.push({ ...cand, fundingRate: rate });
+            }
         }
 
-        setMarketData(candidatesWithRates);
+        const targetSet = candidateData
+            .sort((a, b) => parseFloat(b.fundingRate) - parseFloat(a.fundingRate))
+            .slice(0, 3);
 
-        const sortedCandidates = candidatesWithRates
-            .filter(c => parseFloat(c.fundingRate) > 0)
-            .sort((a, b) => parseFloat(b.fundingRate) - parseFloat(a.fundingRate));
+        setMarketData(candidateData); 
 
-        const topCandidate = sortedCandidates[0]; 
-        const minRateThreshold = strategy.parameters.minFundingRate || 0.0003;
+        const currentManagedPositions = positionsRef.current.filter(p => parseFloat(p.pos) !== 0);
+        const rotationThreshold = strategy.parameters.rotationThreshold || 0.0002;
+        const exitThreshold = strategy.parameters.exitThreshold || 0.0001;
 
-        if (!topCandidate || parseFloat(topCandidate.fundingRate) < minRateThreshold) {
-             addLog('info', 'STRATEGY', `当前市场无高收益机会 (Max: ${topCandidate?.fundingRate || 0})`);
-        } else {
-             addLog('success', 'STRATEGY', `发现最佳标的: ${topCandidate.instId} (Rate: ${(parseFloat(topCandidate.fundingRate)*100).toFixed(4)}%)`);
-        }
-
-        const currentPositions = positionsRef.current;
-        const currentHolding = currentPositions.find(p => parseInt(p.pos) !== 0);
-
-        if (currentHolding) {
-            const holdingRate = await okxService.getFundingRate(currentHolding.instId);
-            const exitThreshold = strategy.parameters.exitThreshold || 0.0001;
-            const rotationThreshold = strategy.parameters.rotationThreshold || 0.0002;
-
-            if (parseFloat(holdingRate) < exitThreshold) {
-                addLog('warning', 'STRATEGY', `[EXIT] 持仓 ${currentHolding.instId} 费率过低 (${holdingRate})。`);
-                const instInfo = instrumentsRef.current.find(i => i.instId === currentHolding.instId);
-                if (instInfo) await okxService.executeDualSideExit(currentHolding.instId, instInfo, currentHolding.pos);
-                updateStrategyLastRun(strategy.id);
-                return;
+        for (const pos of currentManagedPositions) {
+            const currentRateStr = await okxService.getFundingRate(pos.instId);
+            const currentRate = parseFloat(currentRateStr);
+            const instInfo = instrumentsRef.current.find(i => i.instId === pos.instId);
+            
+            if (currentRate < exitThreshold) {
+                addLog('warning', 'STRATEGY', `[退出信号] ${pos.instId} 费率 (${(currentRate*100).toFixed(4)}%) 低于离场阈值。`);
+                if (instInfo) await okxService.executeDualSideExit(pos.instId, instInfo, pos.pos);
+                continue;
             }
 
-            if (topCandidate && topCandidate.instId !== currentHolding.instId) {
-                const rateDiff = parseFloat(topCandidate.fundingRate) - parseFloat(holdingRate);
-                if (rateDiff > rotationThreshold) {
-                    addLog('info', 'STRATEGY', `[ROTATION] 切换至 ${topCandidate.instId}。费率差: ${rateDiff.toFixed(5)}。`);
-                    const instInfo = instrumentsRef.current.find(i => i.instId === currentHolding.instId);
-                    if (instInfo) {
-                        const exitRes = await okxService.executeDualSideExit(currentHolding.instId, instInfo, currentHolding.pos);
-                        if (exitRes.success) {
-                            addLog('success', 'STRATEGY', '旧仓位已平，准备切换。');
-                        }
+            const potentialReplacement = targetSet.find(t => 
+                !currentManagedPositions.some(p => p.instId === t.instId) && 
+                (parseFloat(t.fundingRate) - currentRate > rotationThreshold)
+            );
+
+            if (potentialReplacement && currentManagedPositions.length >= 3) {
+                const lowestRatePos = currentManagedPositions.reduce((prev, curr) => 
+                    parseFloat(curr.uplRatio) < parseFloat(prev.uplRatio) ? curr : prev
+                );
+                
+                if (pos.instId === lowestRatePos.instId) {
+                   addLog('info', 'STRATEGY', `[轮动触发] 发现高性价比标的 ${potentialReplacement.instId}。替换当前最低收益位 ${pos.instId}。`);
+                   if (instInfo) await okxService.executeDualSideExit(pos.instId, instInfo, pos.pos);
+                }
+            }
+        }
+
+        const updatedPositions = await okxService.getPositions();
+        const activeCount = updatedPositions.filter(p => parseFloat(p.pos) !== 0).length;
+
+        if (activeCount < 3) {
+            const emptySlots = 3 - activeCount;
+            const entryList = targetSet.filter(t => !updatedPositions.some(p => p.instId === t.instId));
+
+            for (let i = 0; i < Math.min(emptySlots, entryList.length); i++) {
+                const candidate = entryList[i];
+                
+                if (strategy.parameters.useAI) {
+                    const analysis = await analyzeMarketConditions([candidate], strategy.name);
+                    setLastAnalysis(analysis);
+                    if (analysis.recommendedAction !== 'BUY') {
+                        addLog('warning', 'AI', `AI 拒绝入场 ${candidate.instId}: ${analysis.reasoning}`);
+                        continue;
                     }
-                    updateStrategyLastRun(strategy.id);
-                    return;
+                }
+
+                const allocationPct = strategy.parameters.allocationPct || 30;
+                const investAmount = (totalEquityRef.current * (allocationPct / 100)); 
+                
+                const instrumentInfo = instrumentsRef.current.find(inst => inst.instId === candidate.instId);
+                if (instrumentInfo) {
+                    addLog('success', 'STRATEGY', `[入场执行] 目标: ${candidate.instId} | 分配本金: $${investAmount.toFixed(2)} | 当前费率: ${(parseFloat(candidate.fundingRate)*100).toFixed(4)}%`);
+                    const res = await okxService.executeDualSideEntry(candidate.instId, investAmount, instrumentInfo);
+                    if (!res.success) addLog('error', 'STRATEGY', res.message);
                 }
             }
         }
 
-        if (!currentHolding && positionsRef.current.length === 0 && topCandidate && parseFloat(topCandidate.fundingRate) >= minRateThreshold) {
-            if (strategy.parameters.useAI) {
-                // Pass candidates with calculated USDT volume to DeepSeek
-                const analysis = await analyzeMarketConditions([topCandidate], strategy.name, deepseekKeyRef.current);
-                setLastAnalysis(analysis);
-                if (analysis.recommendedAction === 'WAIT' || analysis.recommendedAction === 'SELL') {
-                    addLog('warning', 'AI', `AI 建议观望 ${topCandidate.instId}: ${analysis.reasoning}`);
-                    updateStrategyLastRun(strategy.id);
-                    return;
-                }
-            }
-            const allocationPct = strategy.parameters.allocationPct || 50;
-            const investAmount = (totalEquityRef.current * (allocationPct / 100)); 
-            const instrumentInfo = instrumentsRef.current.find(i => i.instId === topCandidate.instId);
-            if (!instrumentInfo) {
-                addLog('error', 'STRATEGY', `元数据缺失: ${topCandidate.instId}`);
-                return;
-            }
-            const res = await okxService.executeDualSideEntry(topCandidate.instId, investAmount, instrumentInfo);
-            if (res.success) addLog('success', 'STRATEGY', res.message);
-            else addLog('error', 'STRATEGY', res.message);
-        }
         updateStrategyLastRun(strategy.id);
     };
 
@@ -238,6 +235,15 @@ const App: React.FC = () => {
         {activeTab === 'dashboard' && (
           <div className="space-y-6">
             <Dashboard assets={assets} strategies={strategies} marketData={marketData} totalEquity={totalEquity} positions={positions} okxConfig={okxConfig} />
+            <div className="flex justify-end">
+              <button 
+                onClick={() => setIsAnalysisModalOpen(true)}
+                className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-sm font-bold shadow-lg transition-all"
+                disabled={!lastAnalysis}
+              >
+                <Eye className="w-4 h-4" /> 查看最新 AI 分析
+              </button>
+            </div>
             <LogsPanel logs={logs} />
           </div>
         )}
@@ -246,19 +252,11 @@ const App: React.FC = () => {
         {activeTab === 'settings' && (
           <div className="max-w-2xl space-y-6">
             <div className="bg-slate-800 p-6 rounded-xl border border-slate-700">
-              <h2 className="text-lg font-semibold text-white mb-4">DeepSeek AI 模型配置</h2>
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm text-slate-400 mb-1">DeepSeek API Key</label>
-                  <input 
-                    type="password" 
-                    value={deepseekKey}
-                    onChange={(e) => setDeepseekKey(e.target.value)}
-                    placeholder="输入您的 DeepSeek API Key (sk-...)"
-                    className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white focus:border-blue-500 focus:outline-none"
-                  />
-                  <p className="text-xs text-slate-500 mt-1">用于市场情绪分析与风控。Key 仅保存在本地浏览器中。</p>
-                </div>
+              <h2 className="text-lg font-semibold text-white mb-4">Gemini AI 模型配置</h2>
+              <div className="p-4 bg-indigo-500/10 border border-indigo-500/20 rounded-lg">
+                <p className="text-sm text-indigo-200">
+                  系统当前由 <strong>Gemini 3 Pro</strong> 驱动。API 密钥已通过系统环境变量安全配置。
+                </p>
               </div>
             </div>
             <div className="bg-slate-800 p-6 rounded-xl border border-slate-700">

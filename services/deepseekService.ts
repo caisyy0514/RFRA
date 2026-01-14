@@ -1,19 +1,16 @@
-
+import { GoogleGenAI, Type } from "@google/genai";
 import { AIAnalysisResult, TickerData } from '../types';
 
+/**
+ * Uses Gemini API to analyze market conditions for arbitrage opportunities.
+ * Model 'gemini-3-pro-preview' is used for its advanced reasoning capabilities in financial analysis.
+ */
 export const analyzeMarketConditions = async (
   marketData: TickerData[],
-  strategyName: string,
-  apiKey: string
+  strategyName: string
 ): Promise<AIAnalysisResult> => {
-  if (!apiKey) {
-     return {
-      recommendedAction: "ERROR",
-      reasoning: "未配置 DeepSeek API Key，请在设置中添加。",
-      riskScore: 0,
-      suggestedPairs: []
-    };
-  }
+  // Obtain API Key exclusively from environment variable as per security guidelines.
+  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
   // Filter positive rates
   const positiveRateMarketData = marketData.filter(item => parseFloat(item.fundingRate) > 0);
@@ -53,42 +50,44 @@ export const analyzeMarketConditions = async (
 
       市场数据 (Top Candidates):
       ${JSON.stringify(formattedCandidates)}
-
-      请严格只返回 JSON 格式，JSON 结构如下:
-      {
-        "recommendedAction": "BUY" | "SELL" | "HOLD" | "WAIT",
-        "reasoning": "分析理由 (中文)，请重点评估流动性与费率性价比",
-        "riskScore": 0-100,
-        "suggestedPairs": ["币种1-USDT-SWAP"]
-      }
     `;
 
-    const response = await fetch("https://api.deepseek.com/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: "deepseek-chat",
-        messages: [
-          { role: "system", content: "You are a quantitative trading assistant. Always output valid JSON." },
-          { role: "user", content: prompt }
-        ],
-        temperature: 0.1 
-      })
+    const response = await ai.models.generateContent({
+      model: "gemini-3-pro-preview",
+      contents: prompt,
+      config: {
+        systemInstruction: "You are a quantitative trading assistant specialized in crypto arbitrage. Provide a JSON response based on the analysis of provided market data.",
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            recommendedAction: {
+              type: Type.STRING,
+              description: "Final decision: BUY, SELL, HOLD, or WAIT.",
+            },
+            reasoning: {
+              type: Type.STRING,
+              description: "Reasoning for the decision in Chinese.",
+            },
+            riskScore: {
+              type: Type.NUMBER,
+              description: "Risk evaluation score from 0 (safe) to 100 (high risk).",
+            },
+            suggestedPairs: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING },
+              description: "Array of instrument IDs suggested for entry.",
+            }
+          },
+          required: ["recommendedAction", "reasoning", "riskScore", "suggestedPairs"],
+          propertyOrdering: ["recommendedAction", "reasoning", "riskScore", "suggestedPairs"]
+        },
+      }
     });
 
-    const data = await response.json();
-    if (data.error) throw new Error(data.error.message);
+    const result = JSON.parse(response.text.trim()) as AIAnalysisResult;
 
-    const content = data.choices?.[0]?.message?.content;
-    if (!content) throw new Error("DeepSeek 未返回内容");
-
-    const cleanContent = content.replace(/```json/g, '').replace(/```/g, '').trim();
-    const result = JSON.parse(cleanContent) as AIAnalysisResult;
-
-    // Final guard against hallucinations
+    // Final guard against hallucinations: verify that suggested pairs actually meet basic criteria.
     if (result.recommendedAction === 'BUY' && result.suggestedPairs.length > 0) {
        const invalidPairs = result.suggestedPairs.filter(pair => {
           const ticker = marketData.find(t => t.instId === pair);
@@ -108,7 +107,7 @@ export const analyzeMarketConditions = async (
     return result;
 
   } catch (error) {
-    console.error("DeepSeek Analysis Failed:", error);
+    console.error("Gemini Analysis Failed:", error);
     return {
       recommendedAction: "ERROR",
       reasoning: `AI 服务异常: ${error instanceof Error ? error.message : '未知错误'}`,

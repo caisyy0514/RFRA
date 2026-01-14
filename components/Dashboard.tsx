@@ -3,7 +3,7 @@ import React, { useMemo, useState, useEffect } from 'react';
 import { Asset, TickerData, StrategyConfig, Position, OKXConfig } from '../types';
 import { okxService } from '../services/okxService';
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as ReTooltip, Cell } from 'recharts';
-import { DollarSign, Activity, Zap, TrendingUp, Clock, Server, Wallet, AlertCircle } from 'lucide-react';
+import { DollarSign, Activity, Zap, TrendingUp, Clock, Server, Wallet, AlertCircle, PieChart } from 'lucide-react';
 
 interface DashboardProps {
   assets: Asset[];
@@ -44,15 +44,21 @@ const Dashboard: React.FC<DashboardProps> = ({ assets, strategies, marketData, p
       .slice(0, 8); 
   }, [marketData]);
 
-  const estimatedDailyYield = useMemo(() => {
+  const stats = useMemo(() => {
     let dailyUsd = 0;
+    let totalValueDeployed = 0;
+
     positions.forEach(pos => {
         const ticker = marketData.find(m => m.instId === pos.instId);
+        const val = Math.abs(parseFloat(pos.pos) * parseFloat(pos.avgPx));
+        totalValueDeployed += val;
+
         if (ticker) {
-            const val = Math.abs(parseFloat(pos.pos) * parseFloat(pos.avgPx));
             const rate = parseFloat(ticker.fundingRate);
             const isShort = parseFloat(pos.pos) < 0;
             const isRatePositive = rate > 0;
+            
+            // 赚取费率的条件：做空且费率为正，或做多且费率为负
             if ((isShort && isRatePositive) || (!isShort && !isRatePositive)) {
                 dailyUsd += val * Math.abs(rate) * 3;
             } else {
@@ -60,8 +66,11 @@ const Dashboard: React.FC<DashboardProps> = ({ assets, strategies, marketData, p
             }
         }
     });
-    return dailyUsd;
-  }, [positions, marketData]);
+
+    const utilization = totalEquity > 0 ? (totalValueDeployed / totalEquity) * 100 : 0;
+
+    return { dailyUsd, utilization, totalValueDeployed };
+  }, [positions, marketData, totalEquity]);
 
   const formatVolume = (volStr: string) => {
     const vol = parseFloat(volStr);
@@ -84,18 +93,24 @@ const Dashboard: React.FC<DashboardProps> = ({ assets, strategies, marketData, p
         </div>
         <div className="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg relative overflow-hidden">
           <div className="flex flex-col h-full justify-between">
-            <div className="text-slate-400 text-sm font-medium flex items-center gap-2"><Zap className="w-4 h-4 text-yellow-400" /> 预估收益 (Daily)</div>
+            <div className="text-slate-400 text-sm font-medium flex items-center gap-2"><Zap className="w-4 h-4 text-yellow-400" /> 预估收益 (Daily Sum)</div>
             <div>
-                <div className="text-2xl font-bold text-white mt-2 flex items-baseline gap-2">${estimatedDailyYield.toFixed(2)}<span className="text-sm text-slate-500 font-normal">/ day</span></div>
+                <div className={`text-2xl font-bold mt-2 flex items-baseline gap-2 ${stats.dailyUsd >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                  ${stats.dailyUsd.toFixed(2)}
+                  <span className="text-sm text-slate-500 font-normal">/ day</span>
+                </div>
                 <div className="flex items-center mt-1 text-xs text-slate-400"><Clock className="w-3 h-3 mr-1" /> 下次结算: <span className="text-white ml-1">{nextFundingTime}</span></div>
             </div>
           </div>
         </div>
         <div className="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg">
            <div className="flex flex-col h-full justify-between">
-            <div className="text-slate-400 text-sm font-medium flex items-center gap-2"><Activity className="w-4 h-4 text-blue-400" /> 策略状态</div>
+            <div className="text-slate-400 text-sm font-medium flex items-center gap-2"><PieChart className="w-4 h-4 text-blue-400" /> 资金利用率</div>
             <div>
-                <div className="text-2xl font-bold text-white mt-2">{activeStrategies} <span className="text-lg text-slate-500">/ {strategies.length}</span></div>
+                <div className="text-2xl font-bold text-white mt-2">{stats.utilization.toFixed(1)}%</div>
+                <div className="w-full bg-slate-700 h-1 rounded-full mt-2 overflow-hidden">
+                  <div className="bg-blue-500 h-full transition-all duration-500" style={{ width: `${Math.min(stats.utilization, 100)}%` }} />
+                </div>
             </div>
           </div>
         </div>
@@ -112,31 +127,57 @@ const Dashboard: React.FC<DashboardProps> = ({ assets, strategies, marketData, p
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
          <div className="lg:col-span-2 bg-slate-800 rounded-xl border border-slate-700 shadow-lg overflow-hidden flex flex-col">
-            <div className="p-5 border-b border-slate-700 flex justify-between items-center"><h3 className="font-semibold text-white">当前持仓 (Positions)</h3></div>
+            <div className="p-5 border-b border-slate-700 flex justify-between items-center">
+              <h3 className="font-semibold text-white">多币种组合监控 (Position Slots)</h3>
+              <span className="text-xs text-slate-400">最大持仓: 3</span>
+            </div>
             <div className="overflow-x-auto">
                 <table className="w-full text-left">
                     <thead className="bg-slate-900/50 text-xs uppercase text-slate-400">
-                        <tr><th className="px-5 py-3">合约</th><th className="px-5 py-3">数量</th><th className="px-5 py-3">开仓均价</th><th className="px-5 py-3">未实现盈亏</th></tr>
+                        <tr>
+                          <th className="px-5 py-3">合约标的</th>
+                          <th className="px-5 py-3">仓位详情</th>
+                          <th className="px-5 py-3">实时费率</th>
+                          <th className="px-5 py-3 text-right">未实现盈亏</th>
+                        </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-700 text-sm">
-                        {positions.length === 0 && (<tr><td colSpan={4} className="px-5 py-8 text-center text-slate-500">无持仓</td></tr>)}
-                        {positions.map((pos) => (
-                            <tr key={pos.instId} className="hover:bg-slate-700/30">
-                                <td className="px-5 py-3 font-medium text-white">{pos.instId}</td>
-                                <td className="px-5 py-3"><span className={parseFloat(pos.pos) > 0 ? 'text-emerald-400' : 'text-red-400'}>{parseFloat(pos.pos) > 0 ? 'Buy' : 'Sell'} {Math.abs(parseFloat(pos.pos))}</span></td>
-                                <td className="px-5 py-3 text-slate-300 font-mono">${parseFloat(pos.avgPx).toLocaleString()}</td>
-                                <td className="px-5 py-3 font-mono">
-                                    <div className={parseFloat(pos.upl) >= 0 ? 'text-emerald-400' : 'text-red-400'}>{parseFloat(pos.upl) >= 0 ? '+' : ''}{parseFloat(pos.upl).toFixed(2)}</div>
-                                </td>
-                            </tr>
-                        ))}
+                        {positions.length === 0 && (<tr><td colSpan={4} className="px-5 py-12 text-center text-slate-500 font-medium">暂无活跃套利组合，等待引擎入场...</td></tr>)}
+                        {positions.map((pos) => {
+                            const ticker = marketData.find(m => m.instId === pos.instId);
+                            const rate = ticker ? (parseFloat(ticker.fundingRate) * 100).toFixed(4) : '扫描中';
+                            return (
+                                <tr key={pos.instId} className="hover:bg-slate-700/30 transition-colors group">
+                                    <td className="px-5 py-4">
+                                      <div className="font-bold text-white group-hover:text-blue-400 transition-colors">{pos.instId}</div>
+                                      <div className="text-[10px] text-slate-500 uppercase mt-1">Leverage: {pos.lever}x</div>
+                                    </td>
+                                    <td className="px-5 py-4">
+                                      <div className={`font-medium ${parseFloat(pos.pos) > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                                        {parseFloat(pos.pos) > 0 ? 'LONG' : 'SHORT'} {Math.abs(parseFloat(pos.pos))} 张
+                                      </div>
+                                      <div className="text-xs text-slate-400 mt-1 font-mono">${parseFloat(pos.avgPx).toLocaleString()}</div>
+                                    </td>
+                                    <td className="px-5 py-4">
+                                      <div className="text-emerald-400 font-mono font-bold">{rate}%</div>
+                                      <div className="text-[10px] text-slate-500 mt-1">下次结算: {nextFundingTime}</div>
+                                    </td>
+                                    <td className="px-5 py-4 text-right">
+                                        <div className={`font-mono font-bold ${parseFloat(pos.upl) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                                          {parseFloat(pos.upl) >= 0 ? '+' : ''}{parseFloat(pos.upl).toFixed(2)}
+                                        </div>
+                                        <div className="text-[10px] text-slate-500 mt-1">ROE: {(parseFloat(pos.uplRatio) * 100).toFixed(2)}%</div>
+                                    </td>
+                                </tr>
+                            );
+                        })}
                     </tbody>
                 </table>
             </div>
          </div>
 
          <div className="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg flex flex-col h-[480px]">
-            <h3 className="font-semibold text-white mb-4">实时资金费率扫描 (Top 8)</h3>
+            <h3 className="font-semibold text-white mb-4">优选费率雷达 (Top 8 Candidates)</h3>
             <div className="flex-1 min-h-[350px]">
                 <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={topFundingPairs} layout="vertical" margin={{ top: 5, right: 30, left: 10, bottom: 5 }}>
@@ -163,11 +204,11 @@ const Dashboard: React.FC<DashboardProps> = ({ assets, strategies, marketData, p
                 </BarChart>
                 </ResponsiveContainer>
             </div>
-            <div className="mt-4 p-3 bg-slate-900/50 rounded-lg border border-slate-700 flex items-start gap-2">
-                <div className="flex gap-2 text-[10px] text-slate-400">
-                   <span className="flex items-center gap-1"><span className="w-2 h-2 bg-emerald-500 rounded-full"></span>正费率</span>
+            <div className="mt-4 p-3 bg-slate-900/50 rounded-lg border border-slate-700">
+                <div className="flex justify-around text-[10px] text-slate-400">
+                   <span className="flex items-center gap-1"><span className="w-2 h-2 bg-emerald-500 rounded-full"></span>高正费率</span>
                    <span className="flex items-center gap-1"><span className="w-2 h-2 bg-red-500 rounded-full"></span>负费率</span>
-                   <span className="flex items-center gap-1"><span className="w-2 h-2 bg-purple-500 rounded-full"></span>持仓标的</span>
+                   <span className="flex items-center gap-1"><span className="w-2 h-2 bg-purple-500 rounded-full"></span>已持仓</span>
                 </div>
             </div>
          </div>

@@ -1,3 +1,4 @@
+
 import React from 'react';
 import { X, ShieldAlert, TrendingUp, TrendingDown, MinusCircle, Lightbulb, Activity } from 'lucide-react';
 import { AIAnalysisResult } from '../types';
@@ -119,7 +120,7 @@ const AnalysisModal: React.FC<AnalysisModalProps> = ({ isOpen, onClose, analysis
         {/* Footer */}
         <div className="p-4 border-t border-slate-800 bg-slate-900/50 text-center">
             <span className="text-xs text-slate-500">
-                本分析由 AI 生成，仅供参考。实际交易决策请结合自身风控模型。
+                本分析由 DeepSeek AI 生成，仅供参考。实际交易决策请结合自身风控模型。
             </span>
         </div>
       </div>

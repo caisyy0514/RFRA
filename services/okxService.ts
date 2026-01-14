@@ -54,7 +54,6 @@ class OKXService {
         const data = await this.request('/api/v5/account/config');
         const mode = data[0]?.acctLv;
         // 1: Simple, 2: Single-currency margin, 3: Multi-currency margin, 4: Portfolio margin
-        // We require at least level 2 (Single-currency) to use Spot as collateral for Swap Short
         if (mode === '1') {
             console.error("Account mode is Simple. Cannot execute Arbitrage.");
             return false;
@@ -90,18 +89,11 @@ class OKXService {
   async getMarketTickers(): Promise<TickerData[]> {
       if (!this.config?.apiKey) return [];
       try {
-          // 1. Get Tickers (Price & Vol)
           const tickerData = await this.request('/api/v5/market/tickers?instType=SWAP');
-          
-          // 2. We can't batch fetch funding rates efficiently for ALL coins in one go via public endpoint easily without instId
-          // Strategy: Filter locally first by volume, then fetch funding rates for candidates.
-          // Note: In a real backend, we'd use WebSocket or loop. Here we return basic data, 
-          // and let the strategy fetch specific funding rates for high-vol items.
-          
           return tickerData.map((t: any) => ({
               instId: t.instId,
               last: t.last,
-              fundingRate: '0', // Placeholder, will be filled by detailed scan
+              fundingRate: '0', 
               volCcy24h: t.volCcy24h,
               ts: t.ts
           }));
@@ -120,47 +112,55 @@ class OKXService {
       }
   }
 
-  // Compatible for Dashboard
+  /**
+   * DYNAMIC SCANNING FOR DASHBOARD
+   * Replaced hardcoded list with top 10 volume pairs scan to ensure UI consistency with strategy results.
+   */
   async getFundingRates(): Promise<TickerData[]> {
     if (!this.config?.apiKey) return [];
-    const coins = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'ADA', 'AVAX', 'OP'];
-    const promises = coins.map(async (coin) => {
-      try {
-        const instId = `${coin}-USDT-SWAP`;
-        const rate = await this.getFundingRate(instId);
-        const ticker = await this.request(`/api/v5/market/ticker?instId=${instId}`);
-        return {
-            instId,
-            last: ticker?.[0]?.last || '0',
-            fundingRate: rate,
-            volCcy24h: ticker?.[0]?.volCcy24h || '0',
-            ts: Date.now().toString()
-        };
-      } catch (e) { return null; }
-    });
-    const results = await Promise.all(promises);
-    return results.filter((r): r is TickerData => r !== null);
+    try {
+        // 1. Get all swap tickers
+        const allTickers = await this.getMarketTickers();
+        
+        // 2. Filter USDT-SWAP and sort by volume to get most relevant coins
+        const topByVol = allTickers
+            .filter(t => t.instId.endsWith('-USDT-SWAP'))
+            .sort((a, b) => parseFloat(b.volCcy24h) - parseFloat(a.volCcy24h))
+            .slice(0, 15); // Check top 15 volume coins
+
+        // 3. Fetch funding rates for these top 15
+        const promises = topByVol.map(async (ticker) => {
+            try {
+                const rate = await this.getFundingRate(ticker.instId);
+                return {
+                    ...ticker,
+                    fundingRate: rate,
+                    ts: Date.now().toString()
+                };
+            } catch (e) { return null; }
+        });
+        
+        const results = await Promise.all(promises);
+        return results.filter((r): r is TickerData => r !== null);
+    } catch (e) {
+        console.error("Failed to fetch dynamic funding rates", e);
+        return [];
+    }
   }
 
   // --- 3. Atomic Execution Logic (Entry) ---
 
-  /**
-   * ATOMIC ENTRY: Buy Spot + Short Swap
-   * Implements strict revert logic if second leg fails.
-   */
   async executeDualSideEntry(
-      instId: string, // e.g. DOGE-USDT-SWAP
+      instId: string, 
       usdtAmount: number,
       instrument: Instrument
   ): Promise<{ success: boolean; message: string }> {
-      const baseCcy = instrument.baseCcy; // DOGE
-      const quoteCcy = instrument.quoteCcy; // USDT
-      const spotInstId = `${baseCcy}-${quoteCcy}`; // DOGE-USDT
+      const baseCcy = instrument.baseCcy;
+      const quoteCcy = instrument.quoteCcy;
+      const spotInstId = `${baseCcy}-${quoteCcy}`;
 
       console.log(`[EXEC] Starting Atomic Entry for ${baseCcy}. Target: $${usdtAmount}`);
 
-      // Step 1: Market Buy Spot
-      // We use 'quote_ccy' as target currency to specify USDT amount directly
       let spotOrderId = '';
       let filledCoinSz = 0;
 
@@ -170,7 +170,7 @@ class OKXService {
               tdMode: 'cash',
               side: 'buy',
               ordType: 'market',
-              tgtCcy: 'quote_ccy', // Buy with USDT amount
+              tgtCcy: 'quote_ccy', 
               sz: usdtAmount.toString()
           });
           
@@ -179,15 +179,12 @@ class OKXService {
           }
           spotOrderId = spotOrder[0].ordId;
           
-          // Step 1.5: Verify Spot Fill & Get Exact Size
-          // Wait a brief moment for matching
           await new Promise(r => setTimeout(r, 500));
           
           const orderDetails = await this.request(`/api/v5/trade/order?instId=${spotInstId}&ordId=${spotOrderId}`);
           const fillSz = parseFloat(orderDetails[0]?.fillSz || '0');
           
           if (fillSz <= 0) {
-              // Extremely rare for market order, but possible
               throw new Error("Spot order executed but returned 0 fill size");
           }
           filledCoinSz = fillSz;
@@ -197,11 +194,7 @@ class OKXService {
           return { success: false, message: `Spot Leg Failed: ${e instanceof Error ? e.message : 'Unknown'}` };
       }
 
-      // Step 2: Market Short Swap
       try {
-          // Calculate contracts based on spot fill
-          // Contracts = CoinAmount / ContractValue
-          // e.g. 1000 DOGE / 10 (ctVal) = 100 Contracts
           const ctVal = parseFloat(instrument.ctVal);
           const contracts = Math.floor(filledCoinSz / ctVal);
 
@@ -212,9 +205,9 @@ class OKXService {
           console.log(`[EXEC] Shorting Swap: ${contracts} contracts (derived from ${filledCoinSz} spot)`);
 
           const swapOrder = await this.request('/api/v5/trade/order', 'POST', {
-              instId: instId, // DOGE-USDT-SWAP
-              tdMode: 'cross', // Cross Margin - Uses Spot as collateral
-              side: 'sell', // Short
+              instId: instId,
+              tdMode: 'cross', 
+              side: 'sell', 
               ordType: 'market',
               sz: contracts.toString()
           });
@@ -227,17 +220,14 @@ class OKXService {
 
       } catch (swapError) {
           console.error(`[EXEC-FATAL] Swap Leg Failed! Initiating REVERT for ${spotInstId}`);
-          
-          // --- REVERT LOGIC ---
-          // Immediate Market Sell of the spot we just bought
           try {
               await this.request('/api/v5/trade/order', 'POST', {
                   instId: spotInstId,
                   tdMode: 'cash',
                   side: 'sell',
                   ordType: 'market',
-                  tgtCcy: 'base_ccy', // Sell specific coin amount
-                  sz: filledCoinSz.toString() // Sell exactly what we bought
+                  tgtCcy: 'base_ccy', 
+                  sz: filledCoinSz.toString()
               });
               return { 
                   success: false, 
@@ -252,12 +242,10 @@ class OKXService {
       }
   }
 
-  // --- 4. Atomic Execution Logic (Exit) ---
-  
   async executeDualSideExit(
-      instId: string, // SWAP ID
+      instId: string, 
       instrument: Instrument,
-      posSizeContracts: string // Current Position Size (Contracts)
+      posSizeContracts: string 
   ): Promise<{ success: boolean; message: string }> {
       const baseCcy = instrument.baseCcy;
       const spotInstId = `${baseCcy}-${instrument.quoteCcy}`;
@@ -265,16 +253,12 @@ class OKXService {
 
       console.log(`[EXEC] Exiting ${instId}. Closing ${contracts} contracts + Selling Spot.`);
 
-      // Parallel execution is preferred for exit to minimize leg risk, 
-      // but sequential is safer for error handling. Let's do Parallel for speed in exit.
       try {
           const closeSwapPromise = this.request('/api/v5/trade/close-position', 'POST', {
               instId: instId,
               mgnMode: 'cross'
           });
 
-          // For spot, we need to know balance, but assuming 1:1 hedge, we sell all available spot of that coin
-          // Alternatively, calculate exact amount: contracts * ctVal
           const coinAmountToSell = contracts * parseFloat(instrument.ctVal);
           
           const closeSpotPromise = this.request('/api/v5/trade/order', 'POST', {
@@ -294,13 +278,11 @@ class OKXService {
       }
   }
 
-  // --- Standard Getters ---
   async getAccountAssets(): Promise<Asset[]> {
     if (!this.config?.apiKey) return [];
     const data = await this.request('/api/v5/account/balance');
     if (!data || data.length === 0) return [];
     const details = data[0].details;
-    const totalEq = parseFloat(data[0].totalEq);
     return details.map((d: any) => ({
       currency: d.ccy,
       balance: parseFloat(d.cashBal),

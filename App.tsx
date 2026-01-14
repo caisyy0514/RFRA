@@ -32,7 +32,12 @@ const App: React.FC = () => {
     okxService.setConfig(okxConfig);
     if (okxConfig.apiKey) {
         okxService.checkAccountConfiguration().then(valid => {
-            if (!valid) addLog('error', 'SYSTEM', '账户风险：请确保 OKX 已切换为“保证金模式”！');
+            if (!valid) {
+                addLog('error', 'SYSTEM', 'CRITICAL: 账户处于“简单模式”，无法进行合约套利！');
+                addLog('info', 'SYSTEM', '请前往 OKX 模拟盘设置：交易 -> 设置 -> 账户模式 -> 切换为“跨币种保证金模式”。');
+            } else {
+                addLog('success', 'SYSTEM', '账户模式检测通过，支持全仓套利逻辑。');
+            }
         });
         okxService.getInstruments('SWAP').then(setInstruments);
         fetchData();
@@ -82,6 +87,14 @@ const App: React.FC = () => {
     };
 
     const executeMultiAssetStrategy = async (strategy: StrategyConfig) => {
+        // 在策略执行前强制验证一次账户模式
+        const isConfigValid = await okxService.checkAccountConfiguration();
+        if (!isConfigValid) {
+            addLog('error', 'STRATEGY', '策略拦截：账户模式不兼容，请切换为“跨币种保证金模式”后再启动。');
+            toggleStrategy(strategy.id); // 自动关闭不兼容环境下的策略
+            return;
+        }
+
         addLog('info', 'STRATEGY', `[引擎轮询] 正在扫描全市场并验证交易对可用性...`);
         
         const [allTickers, spotInsts] = await Promise.all([
@@ -92,21 +105,15 @@ const App: React.FC = () => {
         const minVol = strategy.parameters.minVolume24h || 5000000;
         const minRate = strategy.parameters.minFundingRate || 0.0002;
         
-        // 1. 初筛：满足基础流动性 + 必须在当前环境（模拟/实盘）中有对应的现货交易对
         const tradeableSwapTickers = allTickers.filter(t => {
             const isSwap = t.instId.endsWith('-USDT-SWAP');
             if (!isSwap) return false;
-            
-            // 构造对应的现货 ID (例如 ETH-USDT-SWAP -> ETH-USDT)
             const parts = t.instId.split('-');
             const expectedSpotId = `${parts[0]}-${parts[1]}`;
-            
-            // 验证现货是否存在
             const hasSpot = spotInsts.some(si => si.instId === expectedSpotId);
             return hasSpot && parseFloat(t.volUsdt24h) > minVol;
         });
         
-        // 2. 批量获取费率并提取 Top 10
         const topCandidates: TickerData[] = [];
         const sortedByVol = tradeableSwapTickers.sort((a, b) => parseFloat(b.volUsdt24h) - parseFloat(a.volUsdt24h)).slice(0, 30);
         
@@ -122,7 +129,6 @@ const App: React.FC = () => {
             return;
         }
 
-        // 3. AI 批量择优与排序
         let finalTradeQueue = topCandidates.sort((a,b) => parseFloat(b.fundingRate) - parseFloat(a.fundingRate));
         if (strategy.parameters.useAI) {
             const analysis = await analyzeMarketConditions(topCandidates.slice(0, 10), strategy.name, deepseekKeyRef.current);
@@ -139,10 +145,7 @@ const App: React.FC = () => {
             }
         }
 
-        // 4. 仓位检查与轮动
         const currentPositions = positionsRef.current.filter(p => parseFloat(p.pos) !== 0);
-        
-        // 离场检查
         for (const pos of currentPositions) {
             const currentRate = parseFloat(await okxService.getFundingRate(pos.instId));
             if (currentRate < (strategy.parameters.exitThreshold || 0.0001)) {
@@ -152,7 +155,6 @@ const App: React.FC = () => {
             }
         }
 
-        // 入场/填充至 Top 3
         const updatedPos = await okxService.getPositions();
         const activeCount = updatedPos.filter(p => parseFloat(p.pos) !== 0).length;
         const maxPos = strategy.parameters.maxPositions || 3;
@@ -162,9 +164,7 @@ const App: React.FC = () => {
             const newEntries = finalTradeQueue.filter(t => !updatedPos.some(p => p.instId === t.instId)).slice(0, slots);
 
             for (const target of newEntries) {
-                // 核心修复：引入随机延时 (抖动)，避开并发报错
                 await new Promise(r => setTimeout(r, Math.random() * 800 + 1000));
-                
                 const investAmt = (totalEquityRef.current * (strategy.parameters.allocationPct || 30) / 100);
                 const swapInfo = instrumentsRef.current.find(i => i.instId === target.instId);
                 

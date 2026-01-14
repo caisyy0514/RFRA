@@ -28,7 +28,6 @@ class OKXService {
 
     const json = await res.json();
     if (json.code !== '0') {
-      // 尝试提取更具体的子错误信息
       const sCode = json.data?.[0]?.sCode;
       const sMsg = json.data?.[0]?.sMsg;
       const subError = (sCode && sCode !== '0') ? ` (Detail: ${sCode} - ${sMsg})` : '';
@@ -37,9 +36,6 @@ class OKXService {
     return json.data;
   }
 
-  /**
-   * 严格按照 OKX 要求的精度进行截断
-   */
   private formatByStep(value: number, step: string): string {
     const stepNum = parseFloat(step);
     if (isNaN(stepNum) || stepNum <= 0) return value.toString();
@@ -59,10 +55,15 @@ class OKXService {
     }
   }
 
+  /**
+   * 检查账户配置：必须非简单模式 (acctLv > 1) 才能执行全仓套利
+   */
   async checkAccountConfiguration(): Promise<boolean> {
     if (!this.config?.apiKey) return false;
     try {
         const data = await this.request('/api/v5/account/config');
+        // acctLv: 1-简单模式, 2-单币种保证金模式, 3-跨币种保证金模式, 4-组合保证金模式
+        // 期现套利必须使用 2, 3 或 4
         return data[0]?.acctLv !== '1';
     } catch (e) {
         return false;
@@ -154,15 +155,14 @@ class OKXService {
           const spotInfo = spotInsts.find(i => i.instId === spotInstId);
           if (!spotInfo) throw new Error(`Spot pair ${spotInstId} not found`);
 
-          // 2. 核心改进：切换至 quote_ccy 下单模式
-          // 在 quote_ccy 模式下，sz 代表的是要花费的 USDT 数量
-          // 预留 1% 作为手续费/安全冗余，确保不触碰余额上限
-          const safeUsdtAmt = (usdtAmount * 0.99).toFixed(2);
+          // 2. 预留 1.5% 作为保证金/手续费/安全冗余
+          const safeUsdtAmt = (usdtAmount * 0.985).toFixed(2);
 
-          // 3. 执行现货买入 (按金额买)
+          // 3. 执行现货买入
+          // 核心修复：tdMode 强制改为 'cross'，适应跨币种保证金模式
           const spotOrder = await this.request('/api/v5/trade/order', 'POST', {
               instId: spotInstId,
-              tdMode: 'cash',
+              tdMode: 'cross', // 统一为 cross
               side: 'buy',
               ordType: 'market',
               tgtCcy: 'quote_ccy', 
@@ -170,21 +170,20 @@ class OKXService {
           });
           
           const spotOrderId = spotOrder[0]?.ordId;
-          // 模拟盘需要更长的成交同步时间
           await new Promise(r => setTimeout(r, 2000)); 
           
           const orderDetails = await this.request(`/api/v5/trade/order?instId=${spotInstId}&ordId=${spotOrderId}`);
           const fillSz = parseFloat(orderDetails[0]?.fillSz || '0');
-          if (fillSz <= 0) throw new Error("Spot fill failed: No assets purchased. Check balance.");
+          if (fillSz <= 0) throw new Error("Spot fill failed: Check if account has enough USDT and is in 'Cross-margin' mode.");
 
-          // 4. 根据实际成交的现货数量计算合约张数 (向下取整以确保完全对冲)
+          // 4. 计算合约张数
           const ctVal = parseFloat(swapInstrument.ctVal);
           const contracts = Math.floor(fillSz / ctVal);
 
           if (contracts < 1) {
              // 现货不足 1 张合约，撤回买入
-             await this.request('/api/v5/trade/order', 'POST', { instId: spotInstId, tdMode: 'cash', side: 'sell', ordType: 'market', tgtCcy: 'base_ccy', sz: fillSz.toString() });
-             throw new Error(`Fill amount ${fillSz} ${parts[0]} is too small for 1 contract (ctVal: ${ctVal})`);
+             await this.request('/api/v5/trade/order', 'POST', { instId: spotInstId, tdMode: 'cross', side: 'sell', ordType: 'market', tgtCcy: 'base_ccy', sz: fillSz.toString() });
+             throw new Error(`Fill amount ${fillSz} ${parts[0]} too small for 1 contract (ctVal: ${ctVal})`);
           }
 
           // 5. 执行永续空单开仓
@@ -196,7 +195,7 @@ class OKXService {
               sz: contracts.toString()
           });
 
-          return { success: true, message: `Atomic Entry Success: Spent $${safeUsdtAmt} for ${fillSz} ${parts[0]} + Short ${contracts} lots Swap` };
+          return { success: true, message: `Atomic Entry Success (CROSS): Spent $${safeUsdtAmt} for ${fillSz} ${parts[0]} + Short ${contracts} Swap` };
 
       } catch (e) {
           return { success: false, message: `Atomic Entry Failed: ${e instanceof Error ? e.message : 'Unknown'}` };
@@ -213,16 +212,19 @@ class OKXService {
       const contracts = Math.abs(parseInt(posSizeContracts));
 
       try {
+          // 合约平仓
           const swapPromise = this.request('/api/v5/trade/close-position', 'POST', { instId: instId, mgnMode: 'cross' });
-          const coinAmountToSell = contracts * parseFloat(swapInstrument.ctVal);
           
+          const coinAmountToSell = contracts * parseFloat(swapInstrument.ctVal);
           const spotInsts = await this.getInstruments('SPOT');
           const spotInfo = spotInsts.find(i => i.instId === spotInstId);
           const formattedSz = spotInfo ? this.formatByStep(coinAmountToSell, spotInfo.minSz) : coinAmountToSell.toString();
 
+          // 现货卖出
+          // 核心修复：tdMode 强制改为 'cross'
           const spotPromise = this.request('/api/v5/trade/order', 'POST', {
               instId: spotInstId,
-              tdMode: 'cash',
+              tdMode: 'cross', // 统一为 cross
               side: 'sell',
               ordType: 'market',
               tgtCcy: 'base_ccy',
@@ -230,7 +232,7 @@ class OKXService {
           });
 
           await Promise.all([swapPromise, spotPromise]);
-          return { success: true, message: `Exit Success: Sold ${formattedSz} Spot + Closed Swap Position` };
+          return { success: true, message: `Exit Success (CROSS): Sold ${formattedSz} Spot + Closed Swap Position` };
       } catch (e) {
           return { success: false, message: `Exit Error: ${e instanceof Error ? e.message : 'Unknown'}` };
       }

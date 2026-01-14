@@ -1,4 +1,1 @@
-{
-  "containerized": true,
-  "startCommand": "npm run build && npm run start"
-}
+{}

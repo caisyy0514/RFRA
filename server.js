@@ -90,6 +90,13 @@ app.use('/api/proxy', async (req, res) => {
   }
 });
 
+// --- CRITICAL FIX: API 404 Handler ---
+// This must be placed BEFORE the static file serving or catch-all route.
+// It ensures that any request starting with /api/ that wasn't handled above returns JSON, not HTML.
+app.all('/api/*', (req, res) => {
+  res.status(404).json({ code: '404', msg: 'API Endpoint Not Found' });
+});
+
 // Serve Static Files (Frontend) - POINT TO DIST
 app.use(express.static(path.join(__dirname, 'dist')));
 

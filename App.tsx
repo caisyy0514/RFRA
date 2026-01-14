@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { LayoutDashboard, Settings, Layers, Zap, PlayCircle, List } from 'lucide-react';
+import { LayoutDashboard, Settings, Layers, Zap, PlayCircle, List, Eye } from 'lucide-react';
 import { okxService } from './services/okxService';
 import { analyzeMarketConditions } from './services/deepseekService';
 import Dashboard from './components/Dashboard';
 import StrategyManager from './components/StrategyManager';
 import LogsPanel from './components/LogsPanel';
 import OrdersPanel from './components/OrdersPanel';
+import AnalysisModal from './components/AnalysisModal';
 import { Asset, TickerData, StrategyConfig, LogEntry, OKXConfig, AIAnalysisResult, Position } from './types';
 import { DEFAULT_STRATEGIES, MOCK_LOGS_INIT } from './constants';
 
@@ -21,6 +22,9 @@ const App: React.FC = () => {
   const [strategies, setStrategies] = useState<StrategyConfig[]>(DEFAULT_STRATEGIES);
   const [logs, setLogs] = useState<LogEntry[]>(MOCK_LOGS_INIT);
   const [lastAnalysis, setLastAnalysis] = useState<AIAnalysisResult | null>(null);
+  
+  // UI State
+  const [isAnalysisModalOpen, setIsAnalysisModalOpen] = useState(false);
 
   // Configuration State
   const [deepseekKey, setDeepseekKey] = useState('');
@@ -80,11 +84,13 @@ const App: React.FC = () => {
   const strategiesRef = useRef(strategies);
   const marketDataRef = useRef(marketData);
   const deepseekKeyRef = useRef(deepseekKey);
+  const totalEquityRef = useRef(totalEquity);
 
   // Sync refs for the loop
   useEffect(() => { strategiesRef.current = strategies; }, [strategies]);
   useEffect(() => { marketDataRef.current = marketData; }, [marketData]);
   useEffect(() => { deepseekKeyRef.current = deepseekKey; }, [deepseekKey]);
+  useEffect(() => { totalEquityRef.current = totalEquity; }, [totalEquity]);
 
   useEffect(() => {
     let timeoutId: NodeJS.Timeout;
@@ -108,33 +114,78 @@ const App: React.FC = () => {
     const executeStrategy = async (strategy: StrategyConfig) => {
         addLog('info', 'STRATEGY', `正在评估策略: ${strategy.name}...`);
         
+        let currentAnalysis: AIAnalysisResult | null = null;
+
         // 1. AI Analysis Step
         if (strategy.parameters.useAI) {
            addLog('info', 'AI', '正在请求 DeepSeek 进行市场分析...');
-           const analysis = await analyzeMarketConditions(marketDataRef.current, strategy.name, deepseekKeyRef.current);
-           setLastAnalysis(analysis);
+           currentAnalysis = await analyzeMarketConditions(marketDataRef.current, strategy.name, deepseekKeyRef.current);
+           setLastAnalysis(currentAnalysis);
            
-           if (analysis.recommendedAction === 'ERROR') {
-              addLog('error', 'AI', analysis.reasoning);
+           if (currentAnalysis.recommendedAction === 'ERROR') {
+              addLog('error', 'AI', currentAnalysis.reasoning);
+              updateStrategyLastRun(strategy.id);
+              return;
            } else {
-              addLog('success', 'AI', `分析完成. 建议: ${analysis.recommendedAction}. 理由: ${analysis.reasoning.substring(0, 30)}...`);
+              addLog('success', 'AI', `AI 分析完成，风险评分: ${currentAnalysis.riskScore}。点击顶部查看详情。`);
            }
 
-           if(analysis.riskScore > 80) {
-             addLog('warning', 'STRATEGY', `检测到高风险 (${analysis.riskScore}). 跳过执行.`);
+           // Risk Control Check
+           if(currentAnalysis.riskScore > 80) {
+             addLog('warning', 'STRATEGY', `检测到高风险 (${currentAnalysis.riskScore})，触发风控熔断，跳过执行。`);
              updateStrategyLastRun(strategy.id);
              return;
            }
         }
 
-        // 2. Execution Logic (Simulation)
-        if (Math.random() > 0.8) {
-           try {
-             await okxService.placeOrder('BTC-USDT', 'buy', '0.01');
-             addLog('success', 'OKX', '再平衡订单已提交 (模拟).');
-           } catch (e) {
-             addLog('error', 'STRATEGY', `下单失败: ${e instanceof Error ? e.message : 'Unknown'}`);
-           }
+        // 2. Execution Logic (Real or Simulated based on Analysis)
+        if (currentAnalysis && (currentAnalysis.recommendedAction === 'BUY' || currentAnalysis.recommendedAction === 'SELL')) {
+            const action = currentAnalysis.recommendedAction;
+            const pairsToTrade = currentAnalysis.suggestedPairs || [];
+            
+            if (pairsToTrade.length === 0) {
+                addLog('warning', 'STRATEGY', 'AI 建议交易但未提供具体币对，跳过执行。');
+            } else {
+                // Calculate position size based on equity and allocation %
+                const allocationPct = strategy.parameters.allocationPct || 50;
+                const totalEq = totalEquityRef.current;
+                
+                // If equity is 0 (e.g. data fetch failed or empty account), use a fallback mock equity for pure simulation log visual
+                const safeEquity = totalEq > 0 ? totalEq : 10000; 
+
+                const targetUsdSize = safeEquity * (allocationPct / 100);
+                // Distribute evenly among pairs
+                const perPairUsdSize = targetUsdSize / pairsToTrade.length;
+
+                for (const pair of pairsToTrade) {
+                    try {
+                        // Find current price to calculate quantity
+                        const marketTicker = marketDataRef.current.find(m => m.instId === pair);
+                        const price = parseFloat(marketTicker?.last || '0');
+                        
+                        if (price <= 0) {
+                             addLog('error', 'STRATEGY', `无法获取 ${pair} 的最新价格，跳过下单。`);
+                             continue;
+                        }
+
+                        // Calculate quantity (Coin amount for spot/simple interpretation, or Contracts depending on pair type)
+                        // For this demo, assuming standard calculation: Amount = USD Value / Price
+                        const quantity = (perPairUsdSize / price).toFixed(6);
+
+                        addLog('info', 'STRATEGY', `正在执行: ${action} ${pair}, 目标金额: $${perPairUsdSize.toFixed(2)} (Qty: ${quantity})`);
+
+                        // Call OKX Service
+                        await okxService.placeOrder(pair, action.toLowerCase() as 'buy' | 'sell', quantity);
+                        
+                        addLog('success', 'OKX', `订单已提交: ${pair} ${action} ${quantity}`);
+
+                    } catch (e) {
+                        addLog('error', 'STRATEGY', `下单失败 (${pair}): ${e instanceof Error ? e.message : 'Unknown Error'}`);
+                    }
+                }
+            }
+        } else {
+            addLog('info', 'STRATEGY', '根据 AI 建议 (HOLD/WAIT)，无交易操作。');
         }
 
         updateStrategyLastRun(strategy.id);
@@ -163,7 +214,12 @@ const App: React.FC = () => {
 
   return (
     <div className="min-h-screen bg-slate-900 text-slate-200 font-sans flex flex-col md:flex-row">
-      
+      <AnalysisModal 
+        isOpen={isAnalysisModalOpen} 
+        onClose={() => setIsAnalysisModalOpen(false)} 
+        analysis={lastAnalysis} 
+      />
+
       {/* Sidebar */}
       <aside className="w-full md:w-64 bg-slate-950 border-r border-slate-800 flex flex-col shrink-0">
         <div className="p-6 border-b border-slate-800">
@@ -217,10 +273,19 @@ const App: React.FC = () => {
             <header className="flex justify-between items-center mb-8">
               <h1 className="text-2xl font-bold text-white">市场总览</h1>
               {lastAnalysis && (
-                <div className="flex items-center gap-4 bg-indigo-900/30 px-4 py-2 rounded-lg border border-indigo-500/30">
-                  <span className="text-xs text-indigo-300 uppercase font-bold">最新 AI 观点</span>
-                  <span className="text-sm text-white font-medium">{lastAnalysis.recommendedAction}</span>
-                </div>
+                <button 
+                  onClick={() => setIsAnalysisModalOpen(true)}
+                  className="flex items-center gap-4 bg-indigo-900/30 px-4 py-2 rounded-lg border border-indigo-500/30 hover:bg-indigo-900/50 hover:border-indigo-500/50 transition-all cursor-pointer group"
+                >
+                  <div className="flex flex-col items-end">
+                    <span className="text-xs text-indigo-300 uppercase font-bold flex items-center gap-1">
+                      最新 AI 观点 <Eye className="w-3 h-3 group-hover:text-white" />
+                    </span>
+                    <span className={`text-sm font-bold ${lastAnalysis.recommendedAction === 'BUY' ? 'text-emerald-400' : lastAnalysis.recommendedAction === 'SELL' ? 'text-red-400' : 'text-white'}`}>
+                      {lastAnalysis.recommendedAction} (Risk: {lastAnalysis.riskScore})
+                    </span>
+                  </div>
+                </button>
               )}
             </header>
             <Dashboard 

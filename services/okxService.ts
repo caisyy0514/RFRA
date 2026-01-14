@@ -62,8 +62,6 @@ class OKXService {
     if (!this.config?.apiKey) return false;
     try {
         const data = await this.request('/api/v5/account/config');
-        // acctLv: 1-简单模式, 2-单币种保证金模式, 3-跨币种保证金模式, 4-组合保证金模式
-        // 期现套利必须使用 2, 3 或 4
         return data[0]?.acctLv !== '1';
     } catch (e) {
         return false;
@@ -141,6 +139,9 @@ class OKXService {
     }
   }
 
+  /**
+   * 核心逻辑升级：50% 现金压舱石入场
+   */
   async executeDualSideEntry(
       instId: string, 
       usdtAmount: number,
@@ -150,43 +151,54 @@ class OKXService {
       const spotInstId = `${parts[0]}-${parts[1]}`;
 
       try {
-          // 1. 获取现货产品元数据
           const spotInsts = await this.getInstruments('SPOT');
           const spotInfo = spotInsts.find(i => i.instId === spotInstId);
           if (!spotInfo) throw new Error(`Spot pair ${spotInstId} not found`);
 
-          // 2. 预留 1.5% 作为保证金/手续费/安全冗余
-          const safeUsdtAmt = (usdtAmount * 0.985).toFixed(2);
+          // 核心逻辑：50/50 分配
+          const spotSpendUsdt = usdtAmount * 0.5;
+          const cashReserveUsdt = usdtAmount * 0.5;
+          
+          // 实际买入时再扣除 1% 以抵消潜在手续费和价格波动
+          const safeSpotAmt = (spotSpendUsdt * 0.99).toFixed(2);
 
-          // 3. 执行现货买入
-          // 核心修复：tdMode 强制改为 'cross'，适应跨币种保证金模式
+          // 1. 现货买入 (利用 50% 资金)
           const spotOrder = await this.request('/api/v5/trade/order', 'POST', {
               instId: spotInstId,
-              tdMode: 'cross', // 统一为 cross
+              tdMode: 'cross',
               side: 'buy',
               ordType: 'market',
               tgtCcy: 'quote_ccy', 
-              sz: safeUsdtAmt
+              sz: safeSpotAmt
           });
           
           const spotOrderId = spotOrder[0]?.ordId;
-          await new Promise(r => setTimeout(r, 2000)); 
+          
+          // 给模拟盘结算引擎 3.5 秒同步时间，确保 USDT 减少而现货增加的状态被同步到保证金池
+          await new Promise(r => setTimeout(r, 3500)); 
           
           const orderDetails = await this.request(`/api/v5/trade/order?instId=${spotInstId}&ordId=${spotOrderId}`);
           const fillSz = parseFloat(orderDetails[0]?.fillSz || '0');
-          if (fillSz <= 0) throw new Error("Spot fill failed: Check if account has enough USDT and is in 'Cross-margin' mode.");
+          if (fillSz <= 0) throw new Error("Spot fill failed: No coins received.");
 
-          // 4. 计算合约张数
+          // 2. 根据实际买到的现货数量，计算对应的合约张数
           const ctVal = parseFloat(swapInstrument.ctVal);
           const contracts = Math.floor(fillSz / ctVal);
 
           if (contracts < 1) {
-             // 现货不足 1 张合约，撤回买入
-             await this.request('/api/v5/trade/order', 'POST', { instId: spotInstId, tdMode: 'cross', side: 'sell', ordType: 'market', tgtCcy: 'base_ccy', sz: fillSz.toString() });
-             throw new Error(`Fill amount ${fillSz} ${parts[0]} too small for 1 contract (ctVal: ${ctVal})`);
+             // 自动回滚：如果买入的现货不足以支撑 1 张合约，卖出现货避免单向风险
+             await this.request('/api/v5/trade/order', 'POST', { 
+                 instId: spotInstId, 
+                 tdMode: 'cross', 
+                 side: 'sell', 
+                 ordType: 'market', 
+                 tgtCcy: 'base_ccy', 
+                 sz: fillSz.toString() 
+             });
+             throw new Error(`Insufficient amount for 1 contract. Rolled back.`);
           }
 
-          // 5. 执行永续空单开仓
+          // 3. 执行合约开仓 (使用账户中剩余的 50% 现金作为保证金)
           await this.request('/api/v5/trade/order', 'POST', {
               instId: instId,
               tdMode: 'cross', 
@@ -195,7 +207,10 @@ class OKXService {
               sz: contracts.toString()
           });
 
-          return { success: true, message: `Atomic Entry Success (CROSS): Spent $${safeUsdtAmt} for ${fillSz} ${parts[0]} + Short ${contracts} Swap` };
+          return { 
+              success: true, 
+              message: `[50% 压舱石模式] 入场成功: 使用 $${safeSpotAmt} 买入 ${fillSz} ${parts[0]}, 留存约 $${cashReserveUsdt.toFixed(2)} 现金作为保证金, 开空 ${contracts} 张合约。` 
+          };
 
       } catch (e) {
           return { success: false, message: `Atomic Entry Failed: ${e instanceof Error ? e.message : 'Unknown'}` };
@@ -221,10 +236,9 @@ class OKXService {
           const formattedSz = spotInfo ? this.formatByStep(coinAmountToSell, spotInfo.minSz) : coinAmountToSell.toString();
 
           // 现货卖出
-          // 核心修复：tdMode 强制改为 'cross'
           const spotPromise = this.request('/api/v5/trade/order', 'POST', {
               instId: spotInstId,
-              tdMode: 'cross', // 统一为 cross
+              tdMode: 'cross',
               side: 'sell',
               ordType: 'market',
               tgtCcy: 'base_ccy',
@@ -232,7 +246,7 @@ class OKXService {
           });
 
           await Promise.all([swapPromise, spotPromise]);
-          return { success: true, message: `Exit Success (CROSS): Sold ${formattedSz} Spot + Closed Swap Position` };
+          return { success: true, message: `Exit Success: Sold ${formattedSz} Spot + Closed Swap Position` };
       } catch (e) {
           return { success: false, message: `Exit Error: ${e instanceof Error ? e.message : 'Unknown'}` };
       }
@@ -243,12 +257,23 @@ class OKXService {
     try {
         const data = await this.request('/api/v5/account/balance');
         const details = data[0]?.details || [];
-        return details.map((d: any) => ({
+        // 同时返回账户级的可用保证金，用于 App 的分配计算基数
+        const assets = details.map((d: any) => ({
             currency: d.ccy,
             balance: parseFloat(d.cashBal),
             available: parseFloat(d.availBal),
             equityUsd: parseFloat(d.eqUsd) 
         })).filter((a: Asset) => a.equityUsd > 1 || a.balance > 0);
+        
+        // 扩展：在列表最后附加一个特殊的 "AVAIL_EQ" 资产，仅用于 UI/逻辑内部读取
+        assets.push({
+            currency: 'ACCOUNT_AVAIL_EQ',
+            balance: parseFloat(data[0].availEq || '0'),
+            available: parseFloat(data[0].availEq || '0'),
+            equityUsd: parseFloat(data[0].availEq || '0')
+        });
+
+        return assets;
     } catch (e) { return []; }
   }
 

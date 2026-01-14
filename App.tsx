@@ -17,6 +17,7 @@ const App: React.FC = () => {
   const [positions, setPositions] = useState<Position[]>([]);
   const [instruments, setInstruments] = useState<Instrument[]>([]); 
   const [totalEquity, setTotalEquity] = useState<number>(0);
+  const [availableEq, setAvailableEq] = useState<number>(0); // 账户级可用保证金
   const [strategies, setStrategies] = useState<StrategyConfig[]>(DEFAULT_STRATEGIES);
   const [logs, setLogs] = useState<LogEntry[]>(MOCK_LOGS_INIT);
   const [lastAnalysis, setLastAnalysis] = useState<AIAnalysisResult | null>(null);
@@ -52,10 +53,14 @@ const App: React.FC = () => {
       const [newAssets, newRates, newPositions] = await Promise.all([
         okxService.getAccountAssets(), okxService.getFundingRates(), okxService.getPositions()
       ]);
-      setAssets(newAssets);
+      setAssets(newAssets.filter(a => a.currency !== 'ACCOUNT_AVAIL_EQ'));
       setMarketData(newRates);
       setPositions(newPositions);
-      setTotalEquity(newAssets.reduce((sum, a) => sum + a.equityUsd, 0));
+      
+      const availInfo = newAssets.find(a => a.currency === 'ACCOUNT_AVAIL_EQ');
+      if (availInfo) setAvailableEq(availInfo.available);
+      
+      setTotalEquity(newAssets.filter(a => a.currency !== 'ACCOUNT_AVAIL_EQ').reduce((sum, a) => sum + a.equityUsd, 0));
     } catch (e) { console.error(e); }
   };
 
@@ -63,12 +68,14 @@ const App: React.FC = () => {
   const positionsRef = useRef(positions);
   const instrumentsRef = useRef(instruments);
   const totalEquityRef = useRef(totalEquity);
+  const availableEqRef = useRef(availableEq);
   const deepseekKeyRef = useRef(deepseekKey);
 
   useEffect(() => { strategiesRef.current = strategies; }, [strategies]);
   useEffect(() => { positionsRef.current = positions; }, [positions]);
   useEffect(() => { instrumentsRef.current = instruments; }, [instruments]);
   useEffect(() => { totalEquityRef.current = totalEquity; }, [totalEquity]);
+  useEffect(() => { availableEqRef.current = availableEq; }, [availableEq]);
   useEffect(() => { 
     deepseekKeyRef.current = deepseekKey; 
     localStorage.setItem('deepseek_key', deepseekKey);
@@ -87,15 +94,14 @@ const App: React.FC = () => {
     };
 
     const executeMultiAssetStrategy = async (strategy: StrategyConfig) => {
-        // 在策略执行前强制验证一次账户模式
         const isConfigValid = await okxService.checkAccountConfiguration();
         if (!isConfigValid) {
             addLog('error', 'STRATEGY', '策略拦截：账户模式不兼容，请切换为“跨币种保证金模式”后再启动。');
-            toggleStrategy(strategy.id); // 自动关闭不兼容环境下的策略
+            toggleStrategy(strategy.id);
             return;
         }
 
-        addLog('info', 'STRATEGY', `[引擎轮询] 正在扫描全市场并验证交易对可用性...`);
+        addLog('info', 'STRATEGY', `[引擎轮询] 正在扫描全市场可用标的并计算实时收益率...`);
         
         const [allTickers, spotInsts] = await Promise.all([
           okxService.getMarketTickers(),
@@ -124,7 +130,7 @@ const App: React.FC = () => {
         }
 
         if (topCandidates.length === 0) {
-            addLog('warning', 'STRATEGY', '筛选完成：当前无可用且符合费率阈值的期现对。');
+            addLog('warning', 'STRATEGY', '扫描结束：当前市场未发现满足费率阈值且流动性充足的对冲标的。');
             updateStrategyLastRun(strategy.id);
             return;
         }
@@ -137,9 +143,9 @@ const App: React.FC = () => {
                 finalTradeQueue = analysis.suggestedPairs
                     .map(pair => topCandidates.find(t => t.instId === pair))
                     .filter((t): t is TickerData => !!t);
-                addLog('success', 'AI', `AI 审核建议入场：已确认 ${finalTradeQueue.length} 个优质标的。`);
+                addLog('success', 'AI', `AI 深度评估通过：已核准入场队列，包含 ${finalTradeQueue.length} 个低风险高收益标的。`);
             } else {
-                addLog('warning', 'AI', `AI 风险拦截：${analysis.reasoning}`);
+                addLog('warning', 'AI', `AI 拦截入场：${analysis.reasoning}`);
                 updateStrategyLastRun(strategy.id);
                 return;
             }
@@ -149,12 +155,13 @@ const App: React.FC = () => {
         for (const pos of currentPositions) {
             const currentRate = parseFloat(await okxService.getFundingRate(pos.instId));
             if (currentRate < (strategy.parameters.exitThreshold || 0.0001)) {
-                addLog('warning', 'STRATEGY', `[退出] ${pos.instId} 费率衰减至 ${(currentRate*100).toFixed(4)}%，执行平仓。`);
+                addLog('warning', 'STRATEGY', `[退出逻辑触发] ${pos.instId} 当前费率 ${(currentRate*100).toFixed(4)}% 低于清算阈值，执行平仓对冲。`);
                 const instInfo = instrumentsRef.current.find(i => i.instId === pos.instId);
                 if (instInfo) await okxService.executeDualSideExit(pos.instId, instInfo, pos.pos);
             }
         }
 
+        // 获取最新仓位和账户可用资金
         const updatedPos = await okxService.getPositions();
         const activeCount = updatedPos.filter(p => parseFloat(p.pos) !== 0).length;
         const maxPos = strategy.parameters.maxPositions || 3;
@@ -164,18 +171,23 @@ const App: React.FC = () => {
             const newEntries = finalTradeQueue.filter(t => !updatedPos.some(p => p.instId === t.instId)).slice(0, slots);
 
             for (const target of newEntries) {
-                await new Promise(r => setTimeout(r, Math.random() * 800 + 1000));
-                const investAmt = (totalEquityRef.current * (strategy.parameters.allocationPct || 30) / 100);
+                // 增加抖动延时，确保保证金引擎同步
+                await new Promise(r => setTimeout(r, Math.random() * 1500 + 2000));
+                
+                // 分配逻辑：基于真实可用的 AvailEq 而非总 Equity，并计算单笔分配
+                const investAmt = (availableEqRef.current * (strategy.parameters.allocationPct || 30) / 100);
                 const swapInfo = instrumentsRef.current.find(i => i.instId === target.instId);
                 
-                if (swapInfo) {
-                    addLog('info', 'STRATEGY', `[执行入场] 标的: ${target.instId}, 分配金额: $${investAmt.toFixed(2)}`);
+                if (swapInfo && investAmt > 10) {
+                    addLog('info', 'STRATEGY', `[入场决策] 标的: ${target.instId}, 拟分配购买力: $${investAmt.toFixed(2)} (含 50% 现金留存)`);
                     const res = await okxService.executeDualSideEntry(target.instId, investAmt, swapInfo);
                     if (res.success) {
                         addLog('success', 'STRATEGY', res.message);
                     } else {
-                        addLog('error', 'STRATEGY', `入场失败: ${res.message}`);
+                        addLog('error', 'STRATEGY', `执行失败: ${res.message}`);
                     }
+                } else if (investAmt <= 10) {
+                    addLog('warning', 'STRATEGY', `购买力不足 ($${investAmt.toFixed(2)})，跳过本次入场。`);
                 }
             }
         }

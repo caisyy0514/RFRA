@@ -23,7 +23,6 @@ const App: React.FC = () => {
   const [lastAnalysis, setLastAnalysis] = useState<AIAnalysisResult | null>(null);
   const [isAnalysisModalOpen, setIsAnalysisModalOpen] = useState(false);
   
-  // 恢复 DeepSeek API Key 状态
   const [deepseekKey, setDeepseekKey] = useState('');
   const [okxConfig, setOkxConfig] = useState<OKXConfig>({
     apiKey: '',
@@ -111,19 +110,20 @@ const App: React.FC = () => {
         
         const allTickers = await okxService.getMarketTickers();
         const minVol = strategy.parameters.minVolume24h || 10000000;
+        // CRITICAL FIX: Use volUsdt24h (calculated USDT turnover) for filtering
         const liquidTickers = allTickers.filter(t => 
             t.instId.endsWith('-USDT-SWAP') && 
-            parseFloat(t.volCcy24h) > minVol
+            parseFloat(t.volUsdt24h) > minVol
         );
 
         if (liquidTickers.length === 0) {
-            addLog('warning', 'STRATEGY', '市场流动性不足，未找到满足成交量要求的币种。');
+            addLog('warning', 'STRATEGY', '市场流动性不足，未找到满足成交额要求的币种。');
             updateStrategyLastRun(strategy.id);
             return;
         }
 
         const candidatesToCheck = liquidTickers
-            .sort((a, b) => parseFloat(b.volCcy24h) - parseFloat(a.volCcy24h))
+            .sort((a, b) => parseFloat(b.volUsdt24h) - parseFloat(a.volUsdt24h))
             .slice(0, 30);
         
         const candidatesWithRates: TickerData[] = [];
@@ -182,7 +182,7 @@ const App: React.FC = () => {
 
         if (!currentHolding && positionsRef.current.length === 0 && topCandidate && parseFloat(topCandidate.fundingRate) >= minRateThreshold) {
             if (strategy.parameters.useAI) {
-                // 使用 DeepSeek 进行分析
+                // Pass candidates with calculated USDT volume to DeepSeek
                 const analysis = await analyzeMarketConditions([topCandidate], strategy.name, deepseekKeyRef.current);
                 setLastAnalysis(analysis);
                 if (analysis.recommendedAction === 'WAIT' || analysis.recommendedAction === 'SELL') {

@@ -39,8 +39,9 @@ export interface StrategyConfig {
 export interface TickerData {
   instId: string;
   last: string;
-  fundingRate: string; // Next funding rate
-  volCcy24h: string; // 24h Volume in USD
+  fundingRate: string; 
+  volCcy24h: string; // Original unit (coins for SWAP, USDT for SPOT)
+  volUsdt24h: string; // Calculated absolute USDT turnover
   ts: string;
 }
 

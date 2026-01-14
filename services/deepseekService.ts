@@ -15,11 +15,9 @@ export const analyzeMarketConditions = async (
     };
   }
 
-  // --- 第一层防御：数据源头清洗 (Input Filtering) ---
-  // 仅保留资金费率 > 0 的数据。
+  // Filter positive rates
   const positiveRateMarketData = marketData.filter(item => parseFloat(item.fundingRate) > 0);
 
-  // 如果全市场没有正费率，直接熔断
   if (positiveRateMarketData.length === 0) {
       return {
           recommendedAction: "WAIT",
@@ -29,35 +27,39 @@ export const analyzeMarketConditions = async (
       };
   }
 
-  // 排序并取 Top 15
-  const topCandidates = positiveRateMarketData
+  // Format data for AI: Use calculated USDT volume
+  const formattedCandidates = positiveRateMarketData
       .sort((a, b) => parseFloat(b.fundingRate) - parseFloat(a.fundingRate))
-      .slice(0, 15);
+      .slice(0, 10)
+      .map(t => ({
+          instId: t.instId,
+          fundingRate: `${(parseFloat(t.fundingRate)*100).toFixed(4)}%`,
+          turnoverUsdt24h: `$${(parseFloat(t.volUsdt24h) / 1e6).toFixed(2)}M`, // Display in Millions for clarity
+          lastPrice: t.last
+      }));
 
   try {
     const prompt = `
       你是一个量化加密货币交易专家。
       请分析以下名为 "${strategyName}" 的策略的市场数据。
 
-      策略核心逻辑: 期现套利 (Cash and Carry Arbitrage)
-      操作动作: 现货做多 (Long Spot) + 永续合约做空 (Short Perp)
+      策略逻辑: 期现套利 (Cash and Carry Arbitrage)
       盈利来源: 赚取多头支付给空头的资金费率。
 
-      重要铁律 (CRITICAL RULES):
+      重要铁律:
       1. 必须资金费率 (Funding Rate) > 0 才有套利空间。
-      2. 绝对禁止推荐任何费率为负的币种。
-      3. 如果候选列表中的币种风险都过高，返回 WAIT。
+      2. turnoverUsdt24h 是折算后的真实 USDT 24小时成交额。请确保推荐的币种具有足够的流动性 (通常 > 5M USDT)。
+      3. 如果成交额异常巨大 (例如单币种 > 50B USDT)，请警惕数据异常或市场操纵风险，此时应返回 WAIT。
 
-      当前可用市场数据 (已预筛选为正费率):
-      ${JSON.stringify(topCandidates)}
+      市场数据 (Top Candidates):
+      ${JSON.stringify(formattedCandidates)}
 
-      请严格只返回 JSON 格式，不要包含 Markdown 格式标记。
-      JSON 结构如下:
+      请严格只返回 JSON 格式，JSON 结构如下:
       {
         "recommendedAction": "BUY" | "SELL" | "HOLD" | "WAIT",
-        "reasoning": "简短的分析理由 (必须使用中文)",
-        "riskScore": 0-100的数字 (100为高风险),
-        "suggestedPairs": ["币种1-USDT-SWAP", "币种2-USDT-SWAP"]
+        "reasoning": "分析理由 (中文)，请重点评估流动性与费率性价比",
+        "riskScore": 0-100,
+        "suggestedPairs": ["币种1-USDT-SWAP"]
       }
     `;
 
@@ -70,7 +72,7 @@ export const analyzeMarketConditions = async (
       body: JSON.stringify({
         model: "deepseek-chat",
         messages: [
-          { role: "system", content: "You are a helpful assistant that outputs only JSON." },
+          { role: "system", content: "You are a quantitative trading assistant. Always output valid JSON." },
           { role: "user", content: prompt }
         ],
         temperature: 0.1 
@@ -78,10 +80,7 @@ export const analyzeMarketConditions = async (
     });
 
     const data = await response.json();
-    
-    if (data.error) {
-        throw new Error(data.error.message);
-    }
+    if (data.error) throw new Error(data.error.message);
 
     const content = data.choices?.[0]?.message?.content;
     if (!content) throw new Error("DeepSeek 未返回内容");
@@ -89,21 +88,17 @@ export const analyzeMarketConditions = async (
     const cleanContent = content.replace(/```json/g, '').replace(/```/g, '').trim();
     const result = JSON.parse(cleanContent) as AIAnalysisResult;
 
-    // --- 第二层防御：输出结果后置审查 (Output Validation Guardian) ---
-    // 即使 AI 过滤了，我们也要检查它推荐的币种现在的真实费率。
-    // 如果 AI 推荐了负费率币种，说明出现了严重幻觉，必须强制拦截。
+    // Final guard against hallucinations
     if (result.recommendedAction === 'BUY' && result.suggestedPairs.length > 0) {
        const invalidPairs = result.suggestedPairs.filter(pair => {
           const ticker = marketData.find(t => t.instId === pair);
-          // 如果找不到Ticker，或者费率 <= 0，视为违规
           return !ticker || parseFloat(ticker.fundingRate) <= 0;
        });
 
        if (invalidPairs.length > 0) {
-          console.warn(`[Risk Control] AI Hallucination blocked. Recommended negative rate pairs: ${invalidPairs.join(', ')}`);
           return {
             recommendedAction: "WAIT",
-            reasoning: `风控拦截警告：AI 试图推荐负费率币种 (${invalidPairs.join(', ')})，这违反了套利策略核心逻辑。已强制转为观望状态。`,
+            reasoning: `风控拦截：AI 推荐了不符合套利条件的币种 (${invalidPairs.join(', ')})。`,
             riskScore: 100,
             suggestedPairs: []
           };
@@ -116,7 +111,7 @@ export const analyzeMarketConditions = async (
     console.error("DeepSeek Analysis Failed:", error);
     return {
       recommendedAction: "ERROR",
-      reasoning: `AI 服务请求失败: ${error instanceof Error ? error.message : '未知错误'}`,
+      reasoning: `AI 服务异常: ${error instanceof Error ? error.message : '未知错误'}`,
       riskScore: 0,
       suggestedPairs: []
     };

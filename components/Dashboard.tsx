@@ -41,7 +41,7 @@ const Dashboard: React.FC<DashboardProps> = ({ assets, strategies, marketData, p
   const topFundingPairs = useMemo(() => {
     return [...marketData]
       .sort((a, b) => parseFloat(b.fundingRate) - parseFloat(a.fundingRate))
-      .slice(0, 8); // Show top 8 for better visibility
+      .slice(0, 8); 
   }, [marketData]);
 
   const estimatedDailyYield = useMemo(() => {
@@ -65,9 +65,9 @@ const Dashboard: React.FC<DashboardProps> = ({ assets, strategies, marketData, p
 
   const formatVolume = (volStr: string) => {
     const vol = parseFloat(volStr);
-    if (vol >= 1e9) return `${(vol / 1e9).toFixed(2)}B`;
-    if (vol >= 1e6) return `${(vol / 1e6).toFixed(2)}M`;
-    return vol.toLocaleString();
+    if (vol >= 1e9) return `$${(vol / 1e9).toFixed(2)}B`;
+    if (vol >= 1e6) return `$${(vol / 1e6).toFixed(2)}M`;
+    return `$${vol.toLocaleString()}`;
   };
 
   return (
@@ -148,7 +148,7 @@ const Dashboard: React.FC<DashboardProps> = ({ assets, strategies, marketData, p
                     contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '8px' }}
                     formatter={(val: any, name: any, props: any) => [
                         `${(val * 100).toFixed(4)}%`, 
-                        `费率 (Vol: ${formatVolume(props.payload.volCcy24h)})`
+                        `成交额: ${formatVolume(props.payload.volUsdt24h)}`
                     ]}
                     />
                     <Bar dataKey="fundingRate" radius={[0, 4, 4, 0]} barSize={20}>

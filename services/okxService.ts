@@ -3,6 +3,7 @@ import { OKXConfig, TickerData, Asset, Position, Order, Instrument } from '../ty
 
 class OKXService {
   private config: OKXConfig | null = null;
+  private instrumentsCache: Instrument[] = [];
 
   setConfig(config: OKXConfig) {
     this.config = config;
@@ -53,7 +54,6 @@ class OKXService {
     try {
         const data = await this.request('/api/v5/account/config');
         const mode = data[0]?.acctLv;
-        // 1: Simple, 2: Single-currency margin, 3: Multi-currency margin, 4: Portfolio margin
         if (mode === '1') {
             console.error("Account mode is Simple. Cannot execute Arbitrage.");
             return false;
@@ -71,7 +71,7 @@ class OKXService {
     if (!this.config?.apiKey) return [];
     try {
       const data = await this.request(`/api/v5/public/instruments?instType=${instType}`);
-      return data.map((i: any) => ({
+      const insts = data.map((i: any) => ({
         instId: i.instId,
         baseCcy: i.baseCcy,
         quoteCcy: i.quoteCcy,
@@ -79,24 +79,34 @@ class OKXService {
         minSz: i.minSz,
         tickSz: i.tickSz
       }));
+      this.instrumentsCache = insts;
+      return insts;
     } catch (e) {
       console.error("Failed to fetch instruments", e);
       return [];
     }
   }
 
-  // Fetch ALL SWAP tickers to scan for volume
   async getMarketTickers(): Promise<TickerData[]> {
       if (!this.config?.apiKey) return [];
       try {
           const tickerData = await this.request('/api/v5/market/tickers?instType=SWAP');
-          return tickerData.map((t: any) => ({
-              instId: t.instId,
-              last: t.last,
-              fundingRate: '0', 
-              volCcy24h: t.volCcy24h,
-              ts: t.ts
-          }));
+          return tickerData.map((t: any) => {
+              const lastPrice = parseFloat(t.last);
+              const volCcy = parseFloat(t.volCcy24h);
+              // For SWAP, volCcy24h is the volume in COINS. 
+              // To get USDT turnover, we multiply by the last price.
+              const calculatedVolUsdt = (volCcy * lastPrice).toString();
+              
+              return {
+                  instId: t.instId,
+                  last: t.last,
+                  fundingRate: '0', 
+                  volCcy24h: t.volCcy24h,
+                  volUsdt24h: calculatedVolUsdt,
+                  ts: t.ts
+              };
+          });
       } catch (e) {
           console.error(e);
           return [];
@@ -112,23 +122,15 @@ class OKXService {
       }
   }
 
-  /**
-   * DYNAMIC SCANNING FOR DASHBOARD
-   * Replaced hardcoded list with top 10 volume pairs scan to ensure UI consistency with strategy results.
-   */
   async getFundingRates(): Promise<TickerData[]> {
     if (!this.config?.apiKey) return [];
     try {
-        // 1. Get all swap tickers
         const allTickers = await this.getMarketTickers();
-        
-        // 2. Filter USDT-SWAP and sort by volume to get most relevant coins
         const topByVol = allTickers
             .filter(t => t.instId.endsWith('-USDT-SWAP'))
-            .sort((a, b) => parseFloat(b.volCcy24h) - parseFloat(a.volCcy24h))
-            .slice(0, 15); // Check top 15 volume coins
+            .sort((a, b) => parseFloat(b.volUsdt24h) - parseFloat(a.volUsdt24h))
+            .slice(0, 15);
 
-        // 3. Fetch funding rates for these top 15
         const promises = topByVol.map(async (ticker) => {
             try {
                 const rate = await this.getFundingRate(ticker.instId);
@@ -148,7 +150,7 @@ class OKXService {
     }
   }
 
-  // --- 3. Atomic Execution Logic (Entry) ---
+  // --- 3. Atomic Execution Logic ---
 
   async executeDualSideEntry(
       instId: string, 
@@ -188,7 +190,6 @@ class OKXService {
               throw new Error("Spot order executed but returned 0 fill size");
           }
           filledCoinSz = fillSz;
-          console.log(`[EXEC] Spot Filled: ${filledCoinSz} ${baseCcy}`);
 
       } catch (e) {
           return { success: false, message: `Spot Leg Failed: ${e instanceof Error ? e.message : 'Unknown'}` };
@@ -201,8 +202,6 @@ class OKXService {
           if (contracts < 1) {
              throw new Error("Filled spot amount too small for 1 contract");
           }
-
-          console.log(`[EXEC] Shorting Swap: ${contracts} contracts (derived from ${filledCoinSz} spot)`);
 
           const swapOrder = await this.request('/api/v5/trade/order', 'POST', {
               instId: instId,
@@ -219,7 +218,6 @@ class OKXService {
           }
 
       } catch (swapError) {
-          console.error(`[EXEC-FATAL] Swap Leg Failed! Initiating REVERT for ${spotInstId}`);
           try {
               await this.request('/api/v5/trade/order', 'POST', {
                   instId: spotInstId,
@@ -250,8 +248,6 @@ class OKXService {
       const baseCcy = instrument.baseCcy;
       const spotInstId = `${baseCcy}-${instrument.quoteCcy}`;
       const contracts = Math.abs(parseInt(posSizeContracts));
-
-      console.log(`[EXEC] Exiting ${instId}. Closing ${contracts} contracts + Selling Spot.`);
 
       try {
           const closeSwapPromise = this.request('/api/v5/trade/close-position', 'POST', {

@@ -47,6 +47,32 @@ export interface Asset {
   equityUsd: number;
 }
 
+export interface Position {
+  instId: string;
+  pos: string; // Position size (positive for long, negative for short)
+  avgPx: string;
+  upl: string; // Unrealized PnL
+  uplRatio: string; // PnL Ratio
+  lever: string;
+  liqPx: string; // Liquidation Price
+  mgnMode: 'cross' | 'isolated';
+  cTime: number;
+}
+
+export interface Order {
+  ordId: string;
+  clOrdId: string;
+  instId: string;
+  side: 'buy' | 'sell';
+  ordType: 'limit' | 'market';
+  sz: string; // Size
+  px: string; // Price
+  state: 'live' | 'filled' | 'canceled' | 'partially_filled';
+  cTime: number;
+  fillSz?: string;
+  fillPx?: string;
+}
+
 export interface AIAnalysisResult {
   recommendedAction: string;
   reasoning: string;

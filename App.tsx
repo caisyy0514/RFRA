@@ -1,20 +1,22 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { LayoutDashboard, Settings, Layers, Zap, PlayCircle } from 'lucide-react';
+import { LayoutDashboard, Settings, Layers, Zap, PlayCircle, List } from 'lucide-react';
 import { okxService } from './services/okxService';
 import { analyzeMarketConditions } from './services/deepseekService';
 import Dashboard from './components/Dashboard';
 import StrategyManager from './components/StrategyManager';
 import LogsPanel from './components/LogsPanel';
-import { Asset, TickerData, StrategyConfig, LogEntry, OKXConfig, AIAnalysisResult } from './types';
+import OrdersPanel from './components/OrdersPanel';
+import { Asset, TickerData, StrategyConfig, LogEntry, OKXConfig, AIAnalysisResult, Position } from './types';
 import { DEFAULT_STRATEGIES, MOCK_LOGS_INIT } from './constants';
 
 const App: React.FC = () => {
   // Navigation State
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'strategies' | 'settings'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'strategies' | 'orders' | 'settings'>('dashboard');
 
   // Data State
   const [assets, setAssets] = useState<Asset[]>([]);
   const [marketData, setMarketData] = useState<TickerData[]>([]);
+  const [positions, setPositions] = useState<Position[]>([]);
   const [totalEquity, setTotalEquity] = useState<number>(0);
   const [strategies, setStrategies] = useState<StrategyConfig[]>(DEFAULT_STRATEGIES);
   const [logs, setLogs] = useState<LogEntry[]>(MOCK_LOGS_INIT);
@@ -51,29 +53,29 @@ const App: React.FC = () => {
 
   const fetchData = async () => {
     try {
-      const [newAssets, newRates] = await Promise.all([
+      const [newAssets, newRates, newPositions] = await Promise.all([
         okxService.getAccountAssets(),
-        okxService.getFundingRates()
+        okxService.getFundingRates(),
+        okxService.getPositions()
       ]);
       setAssets(newAssets);
       setMarketData(newRates);
+      setPositions(newPositions);
       
       const equity = newAssets.reduce((sum, a) => sum + a.equityUsd, 0);
       setTotalEquity(equity);
     } catch (e) {
-      // addLog('error', 'OKX', 'Failed to fetch market data');
+       // Silent fail for mock
     }
   };
 
   // Main Strategy Loop with dynamic interval
   const strategiesRef = useRef(strategies);
-  const assetsRef = useRef(assets);
   const marketDataRef = useRef(marketData);
   const deepseekKeyRef = useRef(deepseekKey);
 
   // Sync refs for the loop
   useEffect(() => { strategiesRef.current = strategies; }, [strategies]);
-  useEffect(() => { assetsRef.current = assets; }, [assets]);
   useEffect(() => { marketDataRef.current = marketData; }, [marketData]);
   useEffect(() => { deepseekKeyRef.current = deepseekKey; }, [deepseekKey]);
 
@@ -81,18 +83,11 @@ const App: React.FC = () => {
     let timeoutId: NodeJS.Timeout;
 
     const runLoop = async () => {
-      // Run frequently (every 1s) to check if any strategy needs execution based on its own timestamp
+      // Run frequently to check if any strategy needs execution
       const activeStrats = strategiesRef.current.filter(s => s.isActive);
       
       for (const strategy of activeStrats) {
-        // Determine interval based on holding status
-        // Mock holding check: if any asset other than USDT > 0.1
-        const hasPosition = assetsRef.current.some(a => a.currency !== 'USDT' && a.balance > 0.1);
-        
-        const scanInterval = hasPosition 
-          ? (strategy.parameters.scanIntervalHolding || 20) * 1000 
-          : (strategy.parameters.scanIntervalEmpty || 60) * 1000;
-
+        const scanInterval = (strategy.parameters.scanIntervalEmpty || 60) * 1000;
         const timeSinceLastRun = Date.now() - (strategy.lastRun || 0);
 
         if (timeSinceLastRun >= scanInterval) {
@@ -120,7 +115,6 @@ const App: React.FC = () => {
 
            if(analysis.riskScore > 80) {
              addLog('warning', 'STRATEGY', `检测到高风险 (${analysis.riskScore}). 跳过执行.`);
-             // Update timestamp even if skipped
              updateStrategyLastRun(strategy.id);
              return;
            }
@@ -141,7 +135,7 @@ const App: React.FC = () => {
 
     runLoop();
     return () => clearTimeout(timeoutId);
-  }, []); // Run once on mount, loop manages itself
+  }, []); 
 
   const toggleStrategy = (id: string) => {
     setStrategies(prev => prev.map(s => 
@@ -160,7 +154,7 @@ const App: React.FC = () => {
     <div className="min-h-screen bg-slate-900 text-slate-200 font-sans flex flex-col md:flex-row">
       
       {/* Sidebar */}
-      <aside className="w-full md:w-64 bg-slate-950 border-r border-slate-800 flex flex-col">
+      <aside className="w-full md:w-64 bg-slate-950 border-r border-slate-800 flex flex-col shrink-0">
         <div className="p-6 border-b border-slate-800">
           <div className="flex items-center gap-2 text-emerald-500 font-bold text-xl">
              <Zap className="fill-current" /> QuantX
@@ -174,6 +168,12 @@ const App: React.FC = () => {
             className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-all ${activeTab === 'dashboard' ? 'bg-blue-600 text-white shadow-lg shadow-blue-900/50' : 'text-slate-400 hover:bg-slate-900'}`}
           >
             <LayoutDashboard className="w-5 h-5" /> 仪表盘
+          </button>
+          <button 
+            onClick={() => setActiveTab('orders')}
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-all ${activeTab === 'orders' ? 'bg-blue-600 text-white shadow-lg shadow-blue-900/50' : 'text-slate-400 hover:bg-slate-900'}`}
+          >
+            <List className="w-5 h-5" /> 交易监控
           </button>
           <button 
             onClick={() => setActiveTab('strategies')}
@@ -217,8 +217,20 @@ const App: React.FC = () => {
               strategies={strategies}
               marketData={marketData}
               totalEquity={totalEquity}
+              positions={positions}
+              okxConfig={okxConfig}
             />
             <LogsPanel logs={logs} />
+          </div>
+        )}
+
+        {activeTab === 'orders' && (
+          <div className="space-y-6">
+            <header className="mb-8">
+              <h1 className="text-2xl font-bold text-white">交易执行监控</h1>
+              <p className="text-slate-400">查看当前挂单及历史成交记录。</p>
+            </header>
+            <OrdersPanel />
           </div>
         )}
 

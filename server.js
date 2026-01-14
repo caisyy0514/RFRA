@@ -12,8 +12,14 @@ const PORT = process.env.PORT || 3000;
 // Middleware to parse JSON bodies
 app.use(express.json());
 
-// OKX API Proxy Endpoint
-app.all('/api/proxy/*', async (req, res) => {
+// General Request Logger
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  next();
+});
+
+// OKX API Proxy Endpoint - Using app.use for better path prefix matching
+app.use('/api/proxy', async (req, res) => {
   try {
     // 1. Extract Configuration from Headers
     const apiKey = req.headers['x-api-key'];
@@ -26,8 +32,9 @@ app.all('/api/proxy/*', async (req, res) => {
     }
 
     // 2. Prepare Target URL
-    // Remove '/api/proxy' prefix to get the real OKX path (e.g., /api/v5/account/balance)
-    const requestPath = req.url.replace('/api/proxy', '');
+    // When using app.use, req.url is the path relative to the mount point (/api/proxy)
+    // Example: Client requests /api/proxy/api/v5/account/balance -> req.url is /api/v5/account/balance
+    const requestPath = req.url; 
     const baseUrl = 'https://www.okx.com';
     const targetUrl = `${baseUrl}${requestPath}`;
 
@@ -62,14 +69,16 @@ app.all('/api/proxy/*', async (req, res) => {
       body: method === 'GET' ? undefined : body
     };
 
+    // console.log(`[Proxy] Forwarding to: ${targetUrl}`); // Debug log
+
     const response = await fetch(targetUrl, fetchOptions);
     
-    // Handle non-JSON responses (like 502/504 HTML from Cloudflare)
+    // Handle non-JSON responses (like 502/504 HTML from Cloudflare or upstream errors)
     const contentType = response.headers.get('content-type');
     if (!contentType || !contentType.includes('application/json')) {
         const text = await response.text();
-        console.error('OKX Non-JSON Response:', text);
-        return res.status(response.status).json({ code: '500', msg: 'Upstream Error (Non-JSON)', data: [] });
+        console.error('OKX Non-JSON Response:', text.substring(0, 200));
+        return res.status(502).json({ code: '502', msg: 'Upstream Error (Non-JSON response from OKX)', data: [] });
     }
 
     const data = await response.json();

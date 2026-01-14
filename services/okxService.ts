@@ -55,9 +55,6 @@ class OKXService {
     }
   }
 
-  /**
-   * 检查账户配置：必须非简单模式 (acctLv > 1) 才能执行全仓套利
-   */
   async checkAccountConfiguration(): Promise<boolean> {
     if (!this.config?.apiKey) return false;
     try {
@@ -139,9 +136,6 @@ class OKXService {
     }
   }
 
-  /**
-   * 核心逻辑升级：50% 现金压舱石入场
-   */
   async executeDualSideEntry(
       instId: string, 
       usdtAmount: number,
@@ -159,10 +153,8 @@ class OKXService {
           const spotSpendUsdt = usdtAmount * 0.5;
           const cashReserveUsdt = usdtAmount * 0.5;
           
-          // 实际买入时再扣除 1% 以抵消潜在手续费和价格波动
           const safeSpotAmt = (spotSpendUsdt * 0.99).toFixed(2);
 
-          // 1. 现货买入 (利用 50% 资金)
           const spotOrder = await this.request('/api/v5/trade/order', 'POST', {
               instId: spotInstId,
               tdMode: 'cross',
@@ -174,19 +166,17 @@ class OKXService {
           
           const spotOrderId = spotOrder[0]?.ordId;
           
-          // 给模拟盘结算引擎 3.5 秒同步时间，确保 USDT 减少而现货增加的状态被同步到保证金池
-          await new Promise(r => setTimeout(r, 3500)); 
+          // 给模拟盘结算引擎足够的同步时间
+          await new Promise(r => setTimeout(r, 3800)); 
           
           const orderDetails = await this.request(`/api/v5/trade/order?instId=${spotInstId}&ordId=${spotOrderId}`);
           const fillSz = parseFloat(orderDetails[0]?.fillSz || '0');
           if (fillSz <= 0) throw new Error("Spot fill failed: No coins received.");
 
-          // 2. 根据实际买到的现货数量，计算对应的合约张数
           const ctVal = parseFloat(swapInstrument.ctVal);
           const contracts = Math.floor(fillSz / ctVal);
 
           if (contracts < 1) {
-             // 自动回滚：如果买入的现货不足以支撑 1 张合约，卖出现货避免单向风险
              await this.request('/api/v5/trade/order', 'POST', { 
                  instId: spotInstId, 
                  tdMode: 'cross', 
@@ -198,7 +188,13 @@ class OKXService {
              throw new Error(`Insufficient amount for 1 contract. Rolled back.`);
           }
 
-          // 3. 执行合约开仓 (使用账户中剩余的 50% 现金作为保证金)
+          // 再次确认可用现金是否足以支撑该合约的保证金占用
+          const balData = await this.request('/api/v5/account/balance?ccy=USDT');
+          const usdtAvail = parseFloat(balData[0]?.details?.[0]?.availBal || '0');
+          if (usdtAvail < (contracts * ctVal * parseFloat(orderDetails[0]?.fillPx || '0') * 0.1)) { // 假设 10% 初始保证金
+             throw new Error(`Post-spot USDT balance (${usdtAvail}) too low for contract margin.`);
+          }
+
           await this.request('/api/v5/trade/order', 'POST', {
               instId: instId,
               tdMode: 'cross', 
@@ -227,7 +223,6 @@ class OKXService {
       const contracts = Math.abs(parseInt(posSizeContracts));
 
       try {
-          // 合约平仓
           const swapPromise = this.request('/api/v5/trade/close-position', 'POST', { instId: instId, mgnMode: 'cross' });
           
           const coinAmountToSell = contracts * parseFloat(swapInstrument.ctVal);
@@ -235,7 +230,6 @@ class OKXService {
           const spotInfo = spotInsts.find(i => i.instId === spotInstId);
           const formattedSz = spotInfo ? this.formatByStep(coinAmountToSell, spotInfo.minSz) : coinAmountToSell.toString();
 
-          // 现货卖出
           const spotPromise = this.request('/api/v5/trade/order', 'POST', {
               instId: spotInstId,
               tdMode: 'cross',
@@ -257,15 +251,13 @@ class OKXService {
     try {
         const data = await this.request('/api/v5/account/balance');
         const details = data[0]?.details || [];
-        // 同时返回账户级的可用保证金，用于 App 的分配计算基数
         const assets = details.map((d: any) => ({
             currency: d.ccy,
             balance: parseFloat(d.cashBal),
-            available: parseFloat(d.availBal),
+            available: parseFloat(d.availBal), // 关键：这是真实的可用现金
             equityUsd: parseFloat(d.eqUsd) 
         })).filter((a: Asset) => a.equityUsd > 1 || a.balance > 0);
         
-        // 扩展：在列表最后附加一个特殊的 "AVAIL_EQ" 资产，仅用于 UI/逻辑内部读取
         assets.push({
             currency: 'ACCOUNT_AVAIL_EQ',
             balance: parseFloat(data[0].availEq || '0'),

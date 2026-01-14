@@ -17,7 +17,7 @@ const App: React.FC = () => {
   const [positions, setPositions] = useState<Position[]>([]);
   const [instruments, setInstruments] = useState<Instrument[]>([]); 
   const [totalEquity, setTotalEquity] = useState<number>(0);
-  const [availableEq, setAvailableEq] = useState<number>(0); // 账户级可用保证金
+  const [availableEq, setAvailableEq] = useState<number>(0); 
   const [strategies, setStrategies] = useState<StrategyConfig[]>(DEFAULT_STRATEGIES);
   const [logs, setLogs] = useState<LogEntry[]>(MOCK_LOGS_INIT);
   const [lastAnalysis, setLastAnalysis] = useState<AIAnalysisResult | null>(null);
@@ -67,14 +67,14 @@ const App: React.FC = () => {
   const strategiesRef = useRef(strategies);
   const positionsRef = useRef(positions);
   const instrumentsRef = useRef(instruments);
-  const totalEquityRef = useRef(totalEquity);
+  const assetsRef = useRef(assets);
   const availableEqRef = useRef(availableEq);
   const deepseekKeyRef = useRef(deepseekKey);
 
   useEffect(() => { strategiesRef.current = strategies; }, [strategies]);
   useEffect(() => { positionsRef.current = positions; }, [positions]);
   useEffect(() => { instrumentsRef.current = instruments; }, [instruments]);
-  useEffect(() => { totalEquityRef.current = totalEquity; }, [totalEquity]);
+  useEffect(() => { assetsRef.current = assets; }, [assets]);
   useEffect(() => { availableEqRef.current = availableEq; }, [availableEq]);
   useEffect(() => { 
     deepseekKeyRef.current = deepseekKey; 
@@ -161,7 +161,6 @@ const App: React.FC = () => {
             }
         }
 
-        // 获取最新仓位和账户可用资金
         const updatedPos = await okxService.getPositions();
         const activeCount = updatedPos.filter(p => parseFloat(p.pos) !== 0).length;
         const maxPos = strategy.parameters.maxPositions || 3;
@@ -170,24 +169,33 @@ const App: React.FC = () => {
             const slots = maxPos - activeCount;
             const newEntries = finalTradeQueue.filter(t => !updatedPos.some(p => p.instId === t.instId)).slice(0, slots);
 
+            // [逻辑重构] 本地资金池计数器：使用实际 USDT 现金余额
+            const usdtAsset = assetsRef.current.find(a => a.currency === 'USDT');
+            let remainingUsdtCash = usdtAsset ? usdtAsset.available : 0;
+            const allocationPct = strategy.parameters.allocationPct || 30;
+
             for (const target of newEntries) {
                 // 增加抖动延时，确保保证金引擎同步
-                await new Promise(r => setTimeout(r, Math.random() * 1500 + 2000));
+                await new Promise(r => setTimeout(r, Math.random() * 2000 + 3000));
                 
-                // 分配逻辑：基于真实可用的 AvailEq 而非总 Equity，并计算单笔分配
-                const investAmt = (availableEqRef.current * (strategy.parameters.allocationPct || 30) / 100);
+                // [逻辑重构] 分配基数切换为 USDT 现金，并应用 0.95 安全护城河
+                const investAmt = (remainingUsdtCash * (allocationPct / 100)) * 0.95;
                 const swapInfo = instrumentsRef.current.find(i => i.instId === target.instId);
                 
-                if (swapInfo && investAmt > 10) {
-                    addLog('info', 'STRATEGY', `[入场决策] 标的: ${target.instId}, 拟分配购买力: $${investAmt.toFixed(2)} (含 50% 现金留存)`);
+                if (swapInfo && investAmt > 20) {
+                    addLog('info', 'STRATEGY', `[入场决策] 标的: ${target.instId}, 拟分配 USDT 现金: $${investAmt.toFixed(2)} (账户余现: $${remainingUsdtCash.toFixed(2)})`);
+                    
                     const res = await okxService.executeDualSideEntry(target.instId, investAmt, swapInfo);
                     if (res.success) {
                         addLog('success', 'STRATEGY', res.message);
+                        // 更新本地计数器，防止下一笔订单撞上保证金墙
+                        remainingUsdtCash -= investAmt;
                     } else {
                         addLog('error', 'STRATEGY', `执行失败: ${res.message}`);
                     }
-                } else if (investAmt <= 10) {
-                    addLog('warning', 'STRATEGY', `购买力不足 ($${investAmt.toFixed(2)})，跳过本次入场。`);
+                } else if (investAmt <= 20) {
+                    addLog('warning', 'STRATEGY', `USDT 现金可用量过低 ($${investAmt.toFixed(2)})，停止本轮入场决策。`);
+                    break; // 现金不足，直接终止本轮循环
                 }
             }
         }

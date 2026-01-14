@@ -21,62 +21,37 @@ const App: React.FC = () => {
   const [logs, setLogs] = useState<LogEntry[]>(MOCK_LOGS_INIT);
   const [lastAnalysis, setLastAnalysis] = useState<AIAnalysisResult | null>(null);
   const [isAnalysisModalOpen, setIsAnalysisModalOpen] = useState(false);
-  
-  // DeepSeek API Key State
   const [deepseekKey, setDeepseekKey] = useState<string>(localStorage.getItem('deepseek_key') || '');
-  
-  const [okxConfig, setOkxConfig] = useState<OKXConfig>({
-    apiKey: '',
-    secretKey: '',
-    passphrase: '',
-    isSimulated: true
-  });
+  const [okxConfig, setOkxConfig] = useState<OKXConfig>({ apiKey: '', secretKey: '', passphrase: '', isSimulated: true });
 
   const addLog = (level: LogEntry['level'], source: LogEntry['source'], message: string) => {
-    setLogs(prev => [...prev, {
-      id: Math.random().toString(36),
-      timestamp: Date.now(),
-      level,
-      source,
-      message
-    }]);
+    setLogs(prev => [...prev, { id: Math.random().toString(36), timestamp: Date.now(), level, source, message }]);
   };
 
   useEffect(() => {
     okxService.setConfig(okxConfig);
-    const init = async () => {
-        if (okxConfig.apiKey) {
-            const isConfigValid = await okxService.checkAccountConfiguration();
-            if (!isConfigValid) {
-                addLog('error', 'SYSTEM', '账户风险警告：请确保 OKX 账户处于“单币种保证金”或“跨币种保证金”模式！');
-            } else {
-                addLog('info', 'SYSTEM', '账户模式检查通过 (Single/Multi Currency Margin)。');
-            }
-            okxService.getInstruments('SWAP').then(setInstruments).catch(console.error);
-            fetchData();
-        }
-    };
-    init();
+    if (okxConfig.apiKey) {
+        okxService.checkAccountConfiguration().then(valid => {
+            if (!valid) addLog('error', 'SYSTEM', '账户风险：请确保 OKX 已切换为“保证金模式”！');
+        });
+        okxService.getInstruments('SWAP').then(setInstruments);
+        fetchData();
+    }
     const interval = setInterval(fetchData, 15000); 
     return () => clearInterval(interval);
   }, [okxConfig]);
 
   const fetchData = async () => {
+    if (!okxConfig.apiKey) return;
     try {
-      if (!okxConfig.apiKey) return;
       const [newAssets, newRates, newPositions] = await Promise.all([
-        okxService.getAccountAssets(),
-        okxService.getFundingRates(), 
-        okxService.getPositions()
+        okxService.getAccountAssets(), okxService.getFundingRates(), okxService.getPositions()
       ]);
       setAssets(newAssets);
       setMarketData(newRates);
       setPositions(newPositions);
-      const equity = newAssets.reduce((sum, a) => sum + a.equityUsd, 0);
-      setTotalEquity(equity);
-    } catch (e) {
-       console.error(e);
-    }
+      setTotalEquity(newAssets.reduce((sum, a) => sum + a.equityUsd, 0));
+    } catch (e) { console.error(e); }
   };
 
   const strategiesRef = useRef(strategies);
@@ -101,107 +76,80 @@ const App: React.FC = () => {
       for (const strategy of activeStrats) {
         const scanInterval = (strategy.parameters.scanInterval || 60) * 1000;
         const timeSinceLastRun = Date.now() - (strategy.lastRun || 0);
-        if (timeSinceLastRun >= scanInterval) {
-           await executeMultiAssetStrategy(strategy);
-        }
+        if (timeSinceLastRun >= scanInterval) await executeMultiAssetStrategy(strategy);
       }
-      timeoutId = setTimeout(runLoop, 2000); 
+      timeoutId = setTimeout(runLoop, 3000); 
     };
 
     const executeMultiAssetStrategy = async (strategy: StrategyConfig) => {
-        addLog('info', 'STRATEGY', `[引擎轮询] 开始扫描组合目标...`);
-        
+        addLog('info', 'STRATEGY', `[引擎轮询] 正在全市场扫描最优套利组合...`);
         const allTickers = await okxService.getMarketTickers();
-        const minVol = strategy.parameters.minVolume24h || 10000000;
-        const minRate = strategy.parameters.minFundingRate || 0.0003;
+        const minVol = strategy.parameters.minVolume24h || 5000000;
+        const minRate = strategy.parameters.minFundingRate || 0.0002;
         
-        const validTickers = allTickers.filter(t => 
-            t.instId.endsWith('-USDT-SWAP') && 
-            parseFloat(t.volUsdt24h) > minVol
-        );
+        // 1. 全市场初筛 (满足基础流动性)
+        const filtered = allTickers.filter(t => t.instId.endsWith('-USDT-SWAP') && parseFloat(t.volUsdt24h) > minVol);
+        
+        // 2. 批量获取费率并提取 Top 10
+        const topCandidates: TickerData[] = [];
+        const sortedByVol = filtered.sort((a, b) => parseFloat(b.volUsdt24h) - parseFloat(a.volUsdt24h)).slice(0, 30);
+        for (const cand of sortedByVol) {
+            const rate = await okxService.getFundingRate(cand.instId);
+            if (parseFloat(rate) >= minRate) topCandidates.push({ ...cand, fundingRate: rate });
+            if (topCandidates.length >= 10) break;
+        }
 
-        if (validTickers.length === 0) {
-            addLog('warning', 'STRATEGY', '市场流动性不足，未找到满足成交额要求的币种。');
+        if (topCandidates.length === 0) {
+            addLog('warning', 'STRATEGY', '当前市场无高费率标的，继续监控中。');
             updateStrategyLastRun(strategy.id);
             return;
         }
 
-        const candidateBatch = validTickers
-            .sort((a, b) => parseFloat(b.volUsdt24h) - parseFloat(a.volUsdt24h))
-            .slice(0, 30);
+        // 3. AI 批量择优与排序
+        let finalTradeQueue = topCandidates.sort((a,b) => parseFloat(b.fundingRate) - parseFloat(a.fundingRate));
+        if (strategy.parameters.useAI) {
+            const analysis = await analyzeMarketConditions(topCandidates.slice(0, 10), strategy.name, deepseekKeyRef.current);
+            setLastAnalysis(analysis);
+            if (analysis.recommendedAction === 'BUY' && analysis.suggestedPairs.length > 0) {
+                finalTradeQueue = analysis.suggestedPairs
+                    .map(pair => topCandidates.find(t => t.instId === pair))
+                    .filter((t): t is TickerData => !!t);
+                addLog('success', 'AI', `AI 审核完成：已从 10 个标的中选出 ${finalTradeQueue.length} 个高安全性标的。`);
+            } else {
+                addLog('warning', 'AI', `AI 建议观望：${analysis.reasoning}`);
+                updateStrategyLastRun(strategy.id);
+                return;
+            }
+        }
+
+        // 4. 仓位检查与轮动
+        const currentPositions = positionsRef.current.filter(p => parseFloat(p.pos) !== 0);
         
-        const candidateData: TickerData[] = [];
-        for (const cand of candidateBatch) {
-            const rate = await okxService.getFundingRate(cand.instId);
-            if (parseFloat(rate) >= minRate) {
-              candidateData.push({ ...cand, fundingRate: rate });
-            }
-        }
-
-        const targetSet = candidateData
-            .sort((a, b) => parseFloat(b.fundingRate) - parseFloat(a.fundingRate))
-            .slice(0, 3);
-
-        setMarketData(candidateData); 
-
-        const currentManagedPositions = positionsRef.current.filter(p => parseFloat(p.pos) !== 0);
-        const rotationThreshold = strategy.parameters.rotationThreshold || 0.0002;
-        const exitThreshold = strategy.parameters.exitThreshold || 0.0001;
-
-        for (const pos of currentManagedPositions) {
-            const currentRateStr = await okxService.getFundingRate(pos.instId);
-            const currentRate = parseFloat(currentRateStr);
-            const instInfo = instrumentsRef.current.find(i => i.instId === pos.instId);
-            
-            if (currentRate < exitThreshold) {
-                addLog('warning', 'STRATEGY', `[退出信号] ${pos.instId} 费率 (${(currentRate*100).toFixed(4)}%) 低于离场阈值。`);
+        // 离场检查
+        for (const pos of currentPositions) {
+            const currentRate = parseFloat(await okxService.getFundingRate(pos.instId));
+            if (currentRate < (strategy.parameters.exitThreshold || 0.0001)) {
+                addLog('warning', 'STRATEGY', `[退出] ${pos.instId} 费率过低 (${(currentRate*100).toFixed(4)}%)，正在执行原子离场...`);
+                const instInfo = instrumentsRef.current.find(i => i.instId === pos.instId);
                 if (instInfo) await okxService.executeDualSideExit(pos.instId, instInfo, pos.pos);
-                continue;
-            }
-
-            const potentialReplacement = targetSet.find(t => 
-                !currentManagedPositions.some(p => p.instId === t.instId) && 
-                (parseFloat(t.fundingRate) - currentRate > rotationThreshold)
-            );
-
-            if (potentialReplacement && currentManagedPositions.length >= 3) {
-                const lowestRatePos = currentManagedPositions.reduce((prev, curr) => 
-                    parseFloat(curr.uplRatio) < parseFloat(prev.uplRatio) ? curr : prev
-                );
-                
-                if (pos.instId === lowestRatePos.instId) {
-                   addLog('info', 'STRATEGY', `[轮动触发] 发现高性价比标的 ${potentialReplacement.instId}。替换当前最低收益位 ${pos.instId}。`);
-                   if (instInfo) await okxService.executeDualSideExit(pos.instId, instInfo, pos.pos);
-                }
             }
         }
 
-        const updatedPositions = await okxService.getPositions();
-        const activeCount = updatedPositions.filter(p => parseFloat(p.pos) !== 0).length;
+        // 入场/填充至 Top 3
+        const updatedPos = await okxService.getPositions();
+        const activeCount = updatedPos.filter(p => parseFloat(p.pos) !== 0).length;
+        const maxPos = strategy.parameters.maxPositions || 3;
 
-        if (activeCount < 3) {
-            const emptySlots = 3 - activeCount;
-            const entryList = targetSet.filter(t => !updatedPositions.some(p => p.instId === t.instId));
+        if (activeCount < maxPos) {
+            const slots = maxPos - activeCount;
+            const newEntries = finalTradeQueue.filter(t => !updatedPos.some(p => p.instId === t.instId)).slice(0, slots);
 
-            for (let i = 0; i < Math.min(emptySlots, entryList.length); i++) {
-                const candidate = entryList[i];
-                
-                if (strategy.parameters.useAI) {
-                    const analysis = await analyzeMarketConditions([candidate], strategy.name, deepseekKeyRef.current);
-                    setLastAnalysis(analysis);
-                    if (analysis.recommendedAction !== 'BUY') {
-                        addLog('warning', 'AI', `AI 拒绝入场 ${candidate.instId}: ${analysis.reasoning}`);
-                        continue;
-                    }
-                }
-
-                const allocationPct = strategy.parameters.allocationPct || 30;
-                const investAmount = (totalEquityRef.current * (allocationPct / 100)); 
-                
-                const instrumentInfo = instrumentsRef.current.find(inst => inst.instId === candidate.instId);
-                if (instrumentInfo) {
-                    addLog('success', 'STRATEGY', `[入场执行] 目标: ${candidate.instId} | 分配本金: $${investAmount.toFixed(2)} | 当前费率: ${(parseFloat(candidate.fundingRate)*100).toFixed(4)}%`);
-                    const res = await okxService.executeDualSideEntry(candidate.instId, investAmount, instrumentInfo);
+            for (const target of newEntries) {
+                const investAmt = (totalEquityRef.current * (strategy.parameters.allocationPct || 30) / 100);
+                const swapInfo = instrumentsRef.current.find(i => i.instId === target.instId);
+                if (swapInfo) {
+                    addLog('info', 'STRATEGY', `[入场] 执行 ${target.instId} 套利组合，预计占用: $${investAmt.toFixed(2)}`);
+                    const res = await okxService.executeDualSideEntry(target.instId, investAmt, swapInfo);
                     if (!res.success) addLog('error', 'STRATEGY', res.message);
                 }
             }
@@ -217,41 +165,26 @@ const App: React.FC = () => {
     return () => clearTimeout(timeoutId);
   }, []); 
 
-  const toggleStrategy = (id: string) => {
-    setStrategies(prev => prev.map(s => s.id === id ? { ...s, isActive: !s.isActive } : s));
-  };
-
-  const updateStrategy = (updated: StrategyConfig) => {
-    setStrategies(prev => prev.map(s => s.id === updated.id ? updated : s));
-  };
+  const toggleStrategy = (id: string) => setStrategies(prev => prev.map(s => s.id === id ? { ...s, isActive: !s.isActive } : s));
+  const updateStrategy = (updated: StrategyConfig) => setStrategies(prev => prev.map(s => s.id === updated.id ? updated : s));
 
   return (
     <div className="min-h-screen bg-slate-900 text-slate-200 font-sans flex flex-col md:flex-row">
       <AnalysisModal isOpen={isAnalysisModalOpen} onClose={() => setIsAnalysisModalOpen(false)} analysis={lastAnalysis} />
       <aside className="w-full md:w-64 bg-slate-950 border-r border-slate-800 flex flex-col shrink-0">
-        <div className="p-6 border-b border-slate-800">
-          <div className="flex items-center gap-2 text-emerald-500 font-bold text-xl"><Zap className="fill-current" /> QuantX</div>
-        </div>
+        <div className="p-6 border-b border-slate-800"><div className="flex items-center gap-2 text-emerald-500 font-bold text-xl"><Zap className="fill-current" /> QuantX</div></div>
         <nav className="flex-1 p-4 space-y-2">
-          <button onClick={() => setActiveTab('dashboard')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-all ${activeTab === 'dashboard' ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-400 hover:bg-slate-900'}`}><LayoutDashboard className="w-5 h-5" /> 仪表盘</button>
-          <button onClick={() => setActiveTab('orders')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-all ${activeTab === 'orders' ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-400 hover:bg-slate-900'}`}><List className="w-5 h-5" /> 交易监控</button>
-          <button onClick={() => setActiveTab('strategies')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-all ${activeTab === 'strategies' ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-400 hover:bg-slate-900'}`}><Layers className="w-5 h-5" /> 策略管理</button>
-          <button onClick={() => setActiveTab('settings')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-all ${activeTab === 'settings' ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-400 hover:bg-slate-900'}`}><Settings className="w-5 h-5" /> 系统设置</button>
+          <button onClick={() => setActiveTab('dashboard')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg ${activeTab === 'dashboard' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:bg-slate-900'}`}><LayoutDashboard className="w-5 h-5" /> 仪表盘</button>
+          <button onClick={() => setActiveTab('orders')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg ${activeTab === 'orders' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:bg-slate-900'}`}><List className="w-5 h-5" /> 交易监控</button>
+          <button onClick={() => setActiveTab('strategies')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg ${activeTab === 'strategies' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:bg-slate-900'}`}><Layers className="w-5 h-5" /> 策略管理</button>
+          <button onClick={() => setActiveTab('settings')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg ${activeTab === 'settings' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:bg-slate-900'}`}><Settings className="w-5 h-5" /> 系统设置</button>
         </nav>
       </aside>
       <main className="flex-1 overflow-y-auto p-4 md:p-8">
         {activeTab === 'dashboard' && (
           <div className="space-y-6">
             <Dashboard assets={assets} strategies={strategies} marketData={marketData} totalEquity={totalEquity} positions={positions} okxConfig={okxConfig} />
-            <div className="flex justify-end">
-              <button 
-                onClick={() => setIsAnalysisModalOpen(true)}
-                className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-sm font-bold shadow-lg transition-all"
-                disabled={!lastAnalysis}
-              >
-                <Eye className="w-4 h-4" /> 查看最新 AI 分析
-              </button>
-            </div>
+            <div className="flex justify-end"><button onClick={() => setIsAnalysisModalOpen(true)} className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-sm font-bold disabled:opacity-50" disabled={!lastAnalysis}><Eye className="w-4 h-4" /> 查看 AI 批量审核报告</button></div>
             <LogsPanel logs={logs} />
           </div>
         )}
@@ -260,57 +193,17 @@ const App: React.FC = () => {
         {activeTab === 'settings' && (
           <div className="max-w-2xl space-y-6">
             <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-xl">
-              <div className="flex items-center justify-between mb-6">
-                <h2 className="text-xl font-bold text-white flex items-center gap-2">
-                   DeepSeek AI 模型配置
-                </h2>
-                <span className="bg-blue-600/20 text-blue-400 text-[10px] px-2 py-0.5 rounded border border-blue-500/30 uppercase font-bold">DeepSeek-V3</span>
-              </div>
-              
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest mb-2 flex items-center gap-1.5">
-                    <Lock className="w-3 h-3" /> API 密钥 (API Key)
-                  </label>
-                  <input 
-                    type="password" 
-                    placeholder="sk-..." 
-                    value={deepseekKey} 
-                    onChange={(e) => setDeepseekKey(e.target.value)} 
-                    className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-white focus:outline-none focus:border-blue-500 transition-colors shadow-inner font-mono text-sm" 
-                  />
-                  <p className="mt-2 text-[10px] text-slate-500 leading-relaxed italic">
-                    注意：API 密钥仅存储在您的浏览器本地存储 (LocalStorage) 中。系统绝不会将该密钥上传至除 DeepSeek 官方 API 接口以外的任何位置。
-                  </p>
-                </div>
-              </div>
+              <h2 className="text-xl font-bold text-white mb-6 flex items-center gap-2"><Lock className="w-5 h-5 text-blue-400" /> DeepSeek 秘钥配置</h2>
+              <input type="password" placeholder="sk-..." value={deepseekKey} onChange={(e) => setDeepseekKey(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-white font-mono text-sm mb-4" />
+              <p className="text-[10px] text-slate-500 italic">API Key 仅本地加密存储，绝不上传。</p>
             </div>
-
             <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-xl">
-              <h2 className="text-xl font-bold text-white mb-6">OKX V5 交易所连接</h2>
-              <div className="flex items-center gap-3 mb-6 bg-slate-900/50 p-3 rounded-lg border border-slate-700/50">
-                <input 
-                  type="checkbox" 
-                  id="sim-mode"
-                  checked={okxConfig.isSimulated} 
-                  onChange={(e) => setOkxConfig({...okxConfig, isSimulated: e.target.checked})} 
-                  className="w-4 h-4 rounded border-slate-700 bg-slate-950 text-blue-600 focus:ring-blue-600"
-                />
-                <label htmlFor="sim-mode" className="text-sm text-slate-300 font-medium">启用模拟盘 (Simulation Mode)</label>
-              </div>
+              <h2 className="text-xl font-bold text-white mb-6">OKX V5 连接</h2>
               <div className="space-y-4">
-                <div>
-                  <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1.5">API Key</label>
-                  <input type="text" placeholder="Enter OKX API Key" value={okxConfig.apiKey} onChange={(e) => setOkxConfig({...okxConfig, apiKey: e.target.value})} className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-white focus:outline-none focus:border-blue-500 transition-colors font-mono text-sm" />
-                </div>
-                <div>
-                  <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1.5">Secret Key</label>
-                  <input type="password" placeholder="Enter OKX Secret Key" value={okxConfig.secretKey} onChange={(e) => setOkxConfig({...okxConfig, secretKey: e.target.value})} className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-white focus:outline-none focus:border-blue-500 transition-colors font-mono text-sm" />
-                </div>
-                <div>
-                  <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1.5">Passphrase</label>
-                  <input type="password" placeholder="Enter OKX Passphrase" value={okxConfig.passphrase} onChange={(e) => setOkxConfig({...okxConfig, passphrase: e.target.value})} className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-white focus:outline-none focus:border-blue-500 transition-colors font-mono text-sm" />
-                </div>
+                <div className="flex items-center gap-3 mb-2"><input type="checkbox" id="sim" checked={okxConfig.isSimulated} onChange={(e) => setOkxConfig({...okxConfig, isSimulated: e.target.checked})} className="w-4 h-4" /><label htmlFor="sim" className="text-sm">启用模拟盘</label></div>
+                <input type="text" placeholder="API Key" value={okxConfig.apiKey} onChange={(e) => setOkxConfig({...okxConfig, apiKey: e.target.value})} className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-white font-mono text-sm" />
+                <input type="password" placeholder="Secret Key" value={okxConfig.secretKey} onChange={(e) => setOkxConfig({...okxConfig, secretKey: e.target.value})} className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-white font-mono text-sm" />
+                <input type="password" placeholder="Passphrase" value={okxConfig.passphrase} onChange={(e) => setOkxConfig({...okxConfig, passphrase: e.target.value})} className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-white font-mono text-sm" />
               </div>
             </div>
           </div>

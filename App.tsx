@@ -53,6 +53,9 @@ const App: React.FC = () => {
 
   const fetchData = async () => {
     try {
+      // Only fetch if keys are present (even partially) to avoid spamming 401s if empty
+      if (!okxConfig.apiKey) return;
+
       const [newAssets, newRates, newPositions] = await Promise.all([
         okxService.getAccountAssets(),
         okxService.getFundingRates(),
@@ -65,7 +68,11 @@ const App: React.FC = () => {
       const equity = newAssets.reduce((sum, a) => sum + a.equityUsd, 0);
       setTotalEquity(equity);
     } catch (e) {
-       // Silent fail for mock
+       console.error(e);
+       // Log error to UI only if it's not a common "abort" or empty config issue
+       if (okxConfig.apiKey) {
+         addLog('error', 'OKX', `获取数据失败: ${e instanceof Error ? e.message : '未知错误'}`);
+       }
     }
   };
 
@@ -122,8 +129,12 @@ const App: React.FC = () => {
 
         // 2. Execution Logic (Simulation)
         if (Math.random() > 0.8) {
-           await okxService.placeOrder('BTC-USDT', 'buy', '0.01');
-           addLog('success', 'OKX', '再平衡订单已提交 (模拟).');
+           try {
+             await okxService.placeOrder('BTC-USDT', 'buy', '0.01');
+             addLog('success', 'OKX', '再平衡订单已提交 (模拟).');
+           } catch (e) {
+             addLog('error', 'STRATEGY', `下单失败: ${e instanceof Error ? e.message : 'Unknown'}`);
+           }
         }
 
         updateStrategyLastRun(strategy.id);
@@ -316,6 +327,9 @@ const App: React.FC = () => {
                         className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white focus:border-blue-500 focus:outline-none"
                       />
                     </div>
+                 </div>
+                 <div className="bg-slate-900/50 p-3 rounded text-xs text-slate-400">
+                    注意：若启用模拟盘模式，请确保使用 OKX 模拟盘专用的 API Key，否则可能会出现 "Invalid API Key" 错误。
                  </div>
               </div>
             </div>

@@ -2,7 +2,6 @@ import { OKXConfig, TickerData, Asset, Position, Order, Instrument } from '../ty
 
 class OKXService {
   private config: OKXConfig | null = null;
-  private instrumentsCache: Instrument[] = [];
 
   setConfig(config: OKXConfig) {
     this.config = config;
@@ -35,7 +34,7 @@ class OKXService {
   }
 
   /**
-   * 严格按照 OKX 要求的精度进行截断，不进行四舍五入以防超出可用余额
+   * 严格按照 OKX 要求的精度进行截断
    */
   private formatByStep(value: number, step: string): string {
     const stepNum = parseFloat(step);
@@ -79,7 +78,7 @@ class OKXService {
         tickSz: i.tickSz
       }));
     } catch (e) {
-      console.error("Failed to fetch instruments", e);
+      console.error(`Failed to fetch ${instType} instruments`, e);
       return [];
     }
   }
@@ -142,27 +141,32 @@ class OKXService {
       usdtAmount: number,
       swapInstrument: Instrument
   ): Promise<{ success: boolean; message: string }> {
-      const baseCcy = swapInstrument.baseCcy;
-      const spotInstId = `${baseCcy}-USDT`;
+      // 核心修复：解析 instId 提取币种，不再依赖不稳定的 baseCcy 字段
+      // 例: ETH-USDT-SWAP -> ETH-USDT
+      const parts = instId.split('-');
+      const spotInstId = `${parts[0]}-${parts[1]}`;
 
       try {
-          // 1. 获取现货实时价格与精度
-          const [tickerRes, spotInsts] = await Promise.all([
-            this.request(`/api/v5/market/ticker?instId=${spotInstId}`),
-            this.getInstruments('SPOT')
-          ]);
-          
-          const spotPrice = parseFloat(tickerRes[0]?.last || '0');
+          // 1. 获取现货产品列表并验证
+          const spotInsts = await this.getInstruments('SPOT');
           const spotInfo = spotInsts.find(i => i.instId === spotInstId);
-          if (spotPrice <= 0 || !spotInfo) throw new Error("Instrument metadata or price missing");
+          
+          if (!spotInfo) {
+            throw new Error(`Spot pair ${spotInstId} not found in current environment (Common in Simulation)`);
+          }
 
-          // 2. 计算预估购买数量并严格截断 (预留 1.5% 防滑点和手续费)
-          const estimatedCoinSz = (usdtAmount * 0.985) / spotPrice;
+          // 2. 获取实时现货价格
+          const tickerRes = await this.request(`/api/v5/market/ticker?instId=${spotInstId}`);
+          const spotPrice = parseFloat(tickerRes[0]?.last || '0');
+          if (spotPrice <= 0) throw new Error("Invalid spot price received");
+
+          // 3. 计算预估购买数量并严格截断 (预留 2% 保证金/手续费/滑点)
+          const estimatedCoinSz = (usdtAmount * 0.98) / spotPrice;
           const formattedSpotSz = this.formatByStep(estimatedCoinSz, spotInfo.minSz);
 
-          if (parseFloat(formattedSpotSz) <= 0) throw new Error(`Spot size ${formattedSpotSz} too small`);
+          if (parseFloat(formattedSpotSz) <= 0) throw new Error(`Spot order size ${formattedSpotSz} below minimum`);
 
-          // 3. 执行现货买入 (base_ccy 模式兼容性最佳)
+          // 4. 执行现货买入 (base_ccy 模式)
           const spotOrder = await this.request('/api/v5/trade/order', 'POST', {
               instId: spotInstId,
               tdMode: 'cash',
@@ -173,23 +177,23 @@ class OKXService {
           });
           
           const spotOrderId = spotOrder[0]?.ordId;
-          await new Promise(r => setTimeout(r, 1000)); // 等待成交同步
+          await new Promise(r => setTimeout(r, 1500)); // 给交易所一点时间同步订单状态
           
           const orderDetails = await this.request(`/api/v5/trade/order?instId=${spotInstId}&ordId=${spotOrderId}`);
           const fillSz = parseFloat(orderDetails[0]?.fillSz || '0');
-          if (fillSz <= 0) throw new Error("Spot fill error (Check balance)");
+          if (fillSz <= 0) throw new Error("Spot fill error - Order was placed but no coins were filled");
 
-          // 4. 计算合约张数 (向下取整以确保完全对冲)
+          // 5. 计算合约张数 (向下取整以确保完全对冲)
           const ctVal = parseFloat(swapInstrument.ctVal);
           const contracts = Math.floor(fillSz / ctVal);
 
           if (contracts < 1) {
-             // 容错：现货买得太少，不足平掉1张合约，撤回现货
+             // 现货不足 1 张合约，撤回买入
              await this.request('/api/v5/trade/order', 'POST', { instId: spotInstId, tdMode: 'cash', side: 'sell', ordType: 'market', tgtCcy: 'base_ccy', sz: fillSz.toString() });
-             throw new Error(`Filled spot ${fillSz} too small for 1 contract (ctVal: ${ctVal})`);
+             throw new Error(`Fill ${fillSz} too small for 1 contract (ctVal: ${ctVal})`);
           }
 
-          // 5. 执行永续空单开仓
+          // 6. 执行永续空单开仓
           const swapOrder = await this.request('/api/v5/trade/order', 'POST', {
               instId: instId,
               tdMode: 'cross', 
@@ -198,7 +202,7 @@ class OKXService {
               sz: contracts.toString()
           });
 
-          return { success: true, message: `Entry: Long ${fillSz} ${baseCcy} + Short ${contracts} lots ${instId}` };
+          return { success: true, message: `Atomic Entry: Buy ${fillSz} ${parts[0]} Spot + Sell ${contracts} lots Swap` };
 
       } catch (e) {
           return { success: false, message: `Atomic Entry Failed: ${e instanceof Error ? e.message : 'Unknown'}` };
@@ -210,8 +214,8 @@ class OKXService {
       swapInstrument: Instrument,
       posSizeContracts: string 
   ): Promise<{ success: boolean; message: string }> {
-      const baseCcy = swapInstrument.baseCcy;
-      const spotInstId = `${baseCcy}-USDT`;
+      const parts = instId.split('-');
+      const spotInstId = `${parts[0]}-${parts[1]}`;
       const contracts = Math.abs(parseInt(posSizeContracts));
 
       try {
@@ -232,7 +236,7 @@ class OKXService {
           });
 
           await Promise.all([swapPromise, spotPromise]);
-          return { success: true, message: `Exit Success for ${baseCcy}` };
+          return { success: true, message: `Exit Success: Sold ${formattedSz} Spot + Closed Swap Position` };
       } catch (e) {
           return { success: false, message: `Exit Error: ${e instanceof Error ? e.message : 'Unknown'}` };
       }

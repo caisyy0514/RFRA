@@ -82,17 +82,34 @@ const App: React.FC = () => {
     };
 
     const executeMultiAssetStrategy = async (strategy: StrategyConfig) => {
-        addLog('info', 'STRATEGY', `[引擎轮询] 正在全市场扫描最优套利组合...`);
-        const allTickers = await okxService.getMarketTickers();
+        addLog('info', 'STRATEGY', `[引擎轮询] 正在扫描全市场并验证交易对可用性...`);
+        
+        const [allTickers, spotInsts] = await Promise.all([
+          okxService.getMarketTickers(),
+          okxService.getInstruments('SPOT')
+        ]);
+        
         const minVol = strategy.parameters.minVolume24h || 5000000;
         const minRate = strategy.parameters.minFundingRate || 0.0002;
         
-        // 1. 全市场初筛 (满足基础流动性)
-        const filtered = allTickers.filter(t => t.instId.endsWith('-USDT-SWAP') && parseFloat(t.volUsdt24h) > minVol);
+        // 1. 初筛：满足基础流动性 + 必须在当前环境（模拟/实盘）中有对应的现货交易对
+        const tradeableSwapTickers = allTickers.filter(t => {
+            const isSwap = t.instId.endsWith('-USDT-SWAP');
+            if (!isSwap) return false;
+            
+            // 构造对应的现货 ID (例如 ETH-USDT-SWAP -> ETH-USDT)
+            const parts = t.instId.split('-');
+            const expectedSpotId = `${parts[0]}-${parts[1]}`;
+            
+            // 验证现货是否存在
+            const hasSpot = spotInsts.some(si => si.instId === expectedSpotId);
+            return hasSpot && parseFloat(t.volUsdt24h) > minVol;
+        });
         
         // 2. 批量获取费率并提取 Top 10
         const topCandidates: TickerData[] = [];
-        const sortedByVol = filtered.sort((a, b) => parseFloat(b.volUsdt24h) - parseFloat(a.volUsdt24h)).slice(0, 30);
+        const sortedByVol = tradeableSwapTickers.sort((a, b) => parseFloat(b.volUsdt24h) - parseFloat(a.volUsdt24h)).slice(0, 30);
+        
         for (const cand of sortedByVol) {
             const rate = await okxService.getFundingRate(cand.instId);
             if (parseFloat(rate) >= minRate) topCandidates.push({ ...cand, fundingRate: rate });
@@ -100,7 +117,7 @@ const App: React.FC = () => {
         }
 
         if (topCandidates.length === 0) {
-            addLog('warning', 'STRATEGY', '当前市场无高费率标的，继续监控中。');
+            addLog('warning', 'STRATEGY', '筛选完成：当前无可用且符合费率阈值的期现对。');
             updateStrategyLastRun(strategy.id);
             return;
         }
@@ -114,9 +131,9 @@ const App: React.FC = () => {
                 finalTradeQueue = analysis.suggestedPairs
                     .map(pair => topCandidates.find(t => t.instId === pair))
                     .filter((t): t is TickerData => !!t);
-                addLog('success', 'AI', `AI 审核完成：已从 10 个标的中选出 ${finalTradeQueue.length} 个高安全性标的。`);
+                addLog('success', 'AI', `AI 审核建议入场：已确认 ${finalTradeQueue.length} 个优质标的。`);
             } else {
-                addLog('warning', 'AI', `AI 建议观望：${analysis.reasoning}`);
+                addLog('warning', 'AI', `AI 风险拦截：${analysis.reasoning}`);
                 updateStrategyLastRun(strategy.id);
                 return;
             }
@@ -129,7 +146,7 @@ const App: React.FC = () => {
         for (const pos of currentPositions) {
             const currentRate = parseFloat(await okxService.getFundingRate(pos.instId));
             if (currentRate < (strategy.parameters.exitThreshold || 0.0001)) {
-                addLog('warning', 'STRATEGY', `[退出] ${pos.instId} 费率过低 (${(currentRate*100).toFixed(4)}%)，正在执行原子离场...`);
+                addLog('warning', 'STRATEGY', `[退出] ${pos.instId} 费率衰减至 ${(currentRate*100).toFixed(4)}%，执行平仓。`);
                 const instInfo = instrumentsRef.current.find(i => i.instId === pos.instId);
                 if (instInfo) await okxService.executeDualSideExit(pos.instId, instInfo, pos.pos);
             }
@@ -148,9 +165,13 @@ const App: React.FC = () => {
                 const investAmt = (totalEquityRef.current * (strategy.parameters.allocationPct || 30) / 100);
                 const swapInfo = instrumentsRef.current.find(i => i.instId === target.instId);
                 if (swapInfo) {
-                    addLog('info', 'STRATEGY', `[入场] 执行 ${target.instId} 套利组合，预计占用: $${investAmt.toFixed(2)}`);
+                    addLog('info', 'STRATEGY', `[执行入场] 标的: ${target.instId}, 分配金额: $${investAmt.toFixed(2)}`);
                     const res = await okxService.executeDualSideEntry(target.instId, investAmt, swapInfo);
-                    if (!res.success) addLog('error', 'STRATEGY', res.message);
+                    if (res.success) {
+                        addLog('success', 'STRATEGY', res.message);
+                    } else {
+                        addLog('error', 'STRATEGY', `入场失败: ${res.message}`);
+                    }
                 }
             }
         }

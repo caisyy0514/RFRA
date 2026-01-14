@@ -44,7 +44,7 @@ const AnalysisModal: React.FC<AnalysisModalProps> = ({ isOpen, onClose, analysis
                 <Lightbulb className="w-6 h-6 text-indigo-400" />
             </div>
             <div>
-                <h2 className="text-xl font-bold text-white">Gemini 市场深度分析</h2>
+                <h2 className="text-xl font-bold text-white">DeepSeek 市场深度分析</h2>
                 <p className="text-xs text-slate-400">基于实时资金费率与市场波动率模型</p>
             </div>
           </div>
@@ -119,7 +119,7 @@ const AnalysisModal: React.FC<AnalysisModalProps> = ({ isOpen, onClose, analysis
         {/* Footer */}
         <div className="p-4 border-t border-slate-800 bg-slate-900/50 text-center">
             <span className="text-xs text-slate-500">
-                本分析由 Gemini AI 生成，仅供参考。实际交易决策请结合自身风控模型。
+                本分析由 DeepSeek AI 生成，仅供参考。实际交易决策请结合自身风控模型。
             </span>
         </div>
       </div>

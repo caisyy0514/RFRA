@@ -1,93 +1,92 @@
-import { GoogleGenAI, Type } from "@google/genai";
 import { AIAnalysisResult, TickerData } from '../types';
 
 /**
- * Uses Gemini API to analyze market conditions for arbitrage opportunities.
- * Model 'gemini-3-pro-preview' is used for its advanced reasoning capabilities in financial analysis.
+ * 使用 DeepSeek API 分析市场状况以寻找套利机会。
+ * 采用 DeepSeek-Chat 模型进行金融逻辑推理。
  */
 export const analyzeMarketConditions = async (
   marketData: TickerData[],
   strategyName: string
 ): Promise<AIAnalysisResult> => {
-  // Obtain API Key exclusively from environment variable as per security guidelines.
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  // 从环境变量获取 API Key
+  const apiKey = process.env.API_KEY;
 
-  // Filter positive rates
+  if (!apiKey) {
+    return {
+      recommendedAction: "ERROR",
+      reasoning: "未配置 AI API Key，请检查系统环境变量。",
+      riskScore: 0,
+      suggestedPairs: []
+    };
+  }
+
+  // 过滤正费率标的
   const positiveRateMarketData = marketData.filter(item => parseFloat(item.fundingRate) > 0);
 
   if (positiveRateMarketData.length === 0) {
       return {
           recommendedAction: "WAIT",
-          reasoning: "系统风控拦截：当前市场无正资金费率 (>0) 币种。系统自动暂停开仓。",
+          reasoning: "系统风控拦截：当前全市场无正资金费率标的，不具备期现套利基础。",
           riskScore: 0,
           suggestedPairs: []
       };
   }
 
-  // Format data for AI: Use calculated USDT volume
   const formattedCandidates = positiveRateMarketData
       .sort((a, b) => parseFloat(b.fundingRate) - parseFloat(a.fundingRate))
       .slice(0, 10)
       .map(t => ({
           instId: t.instId,
           fundingRate: `${(parseFloat(t.fundingRate)*100).toFixed(4)}%`,
-          turnoverUsdt24h: `$${(parseFloat(t.volUsdt24h) / 1e6).toFixed(2)}M`, // Display in Millions for clarity
+          turnoverUsdt24h: `$${(parseFloat(t.volUsdt24h) / 1e6).toFixed(2)}M`,
           lastPrice: t.last
       }));
 
   try {
     const prompt = `
-      你是一个量化加密货币交易专家。
-      请分析以下名为 "${strategyName}" 的策略的市场数据。
+      你是一个量化加密货币交易专家。请分析策略 "${strategyName}" 的市场数据。
+      策略逻辑: 期现套利 (赚取资金费率)。
+      
+      铁律:
+      1. 必须资金费率 > 0。
+      2. 标的流动性必须充足 (通常 > 5M USDT)。
+      3. 若成交额异常巨大 (如 > 50B USDT)，请警惕异常，返回 WAIT。
 
-      策略逻辑: 期现套利 (Cash and Carry Arbitrage)
-      盈利来源: 赚取多头支付给空头的资金费率。
-
-      重要铁律:
-      1. 必须资金费率 (Funding Rate) > 0 才有套利空间。
-      2. turnoverUsdt24h 是折算后的真实 USDT 24小时成交额。请确保推荐的币种具有足够的流动性 (通常 > 5M USDT)。
-      3. 如果成交额异常巨大 (例如单币种 > 50B USDT)，请警惕数据异常或市场操纵风险，此时应返回 WAIT。
-
-      市场数据 (Top Candidates):
+      待分析数据:
       ${JSON.stringify(formattedCandidates)}
+
+      请以 JSON 格式返回结果，包含以下字段：
+      - recommendedAction: "BUY", "SELL", "HOLD", "WAIT"
+      - reasoning: 中文逻辑分析
+      - riskScore: 0-100 风险分
+      - suggestedPairs: 推荐的币种 ID 数组
     `;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3-pro-preview",
-      contents: prompt,
-      config: {
-        systemInstruction: "You are a quantitative trading assistant specialized in crypto arbitrage. Provide a JSON response based on the analysis of provided market data.",
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            recommendedAction: {
-              type: Type.STRING,
-              description: "Final decision: BUY, SELL, HOLD, or WAIT.",
-            },
-            reasoning: {
-              type: Type.STRING,
-              description: "Reasoning for the decision in Chinese.",
-            },
-            riskScore: {
-              type: Type.NUMBER,
-              description: "Risk evaluation score from 0 (safe) to 100 (high risk).",
-            },
-            suggestedPairs: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-              description: "Array of instrument IDs suggested for entry.",
-            }
-          },
-          required: ["recommendedAction", "reasoning", "riskScore", "suggestedPairs"],
-          propertyOrdering: ["recommendedAction", "reasoning", "riskScore", "suggestedPairs"]
-        },
-      }
+    const response = await fetch("https://api.deepseek.com/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: "deepseek-chat",
+        messages: [
+          { role: "system", content: "你是一个专业的加密货币量化研究员，擅长套利风险评估。请仅返回有效的 JSON 数据。" },
+          { role: "user", content: prompt }
+        ],
+        response_format: { type: "json_object" }
+      })
     });
 
-    const result = JSON.parse(response.text.trim()) as AIAnalysisResult;
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
 
-    // Final guard against hallucinations: verify that suggested pairs actually meet basic criteria.
+    const data = await response.json();
+    const resultString = data.choices[0].message.content;
+    const result = JSON.parse(resultString) as AIAnalysisResult;
+
+    // 二次验证，防止 AI 幻觉
     if (result.recommendedAction === 'BUY' && result.suggestedPairs.length > 0) {
        const invalidPairs = result.suggestedPairs.filter(pair => {
           const ticker = marketData.find(t => t.instId === pair);
@@ -97,7 +96,7 @@ export const analyzeMarketConditions = async (
        if (invalidPairs.length > 0) {
           return {
             recommendedAction: "WAIT",
-            reasoning: `风控拦截：AI 推荐了不符合套利条件的币种 (${invalidPairs.join(', ')})。`,
+            reasoning: `风控拦截：DeepSeek 推荐了费率为负或不存在的币种 (${invalidPairs.join(', ')})。`,
             riskScore: 100,
             suggestedPairs: []
           };
@@ -107,10 +106,10 @@ export const analyzeMarketConditions = async (
     return result;
 
   } catch (error) {
-    console.error("Gemini Analysis Failed:", error);
+    console.error("DeepSeek Analysis Failed:", error);
     return {
       recommendedAction: "ERROR",
-      reasoning: `AI 服务异常: ${error instanceof Error ? error.message : '未知错误'}`,
+      reasoning: `DeepSeek 服务连接异常: ${error instanceof Error ? error.message : '未知错误'}`,
       riskScore: 0,
       suggestedPairs: []
     };

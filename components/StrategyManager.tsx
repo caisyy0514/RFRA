@@ -108,7 +108,6 @@ const StrategyManager: React.FC<StrategyManagerProps> = ({ strategies, onToggleS
                           <div>
                               <label className="block text-xs text-slate-400 mb-1.5 flex items-center gap-1">
                                 最低费率阈值 (minFundingRate)
-                                {/* Fix: Wrap Lucide Info in span with title attribute as title is not a direct prop */}
                                 <span title="高于此费率才考虑入场">
                                   <Info className="w-3 h-3 text-slate-600" />
                                 </span>
@@ -127,7 +126,6 @@ const StrategyManager: React.FC<StrategyManagerProps> = ({ strategies, onToggleS
                           <div>
                               <label className="block text-xs text-slate-400 mb-1.5 flex items-center gap-1">
                                 单币种分配比例 (allocationPct)
-                                {/* Fix: Wrap Lucide Info in span with title attribute as title is not a direct prop */}
                                 <span title="单个币种套利占用的本金百分比">
                                   <Info className="w-3 h-3 text-slate-600" />
                                 </span>
@@ -169,7 +167,7 @@ const StrategyManager: React.FC<StrategyManagerProps> = ({ strategies, onToggleS
                                   <label htmlFor="useAI" className="text-sm text-slate-300 font-medium">启用 AI 最终核准</label>
                              </div>
                              <div className="text-xs text-slate-500 border-l-2 border-blue-500/30 pl-3">
-                               开启后，引擎在执行开仓前会将标的发送给 Gemini 进行流动性与风险评估。
+                               开启后，引擎在执行开仓前会将标的发送给 DeepSeek 进行流动性与风险评估。
                              </div>
                            </div>
                       </div>

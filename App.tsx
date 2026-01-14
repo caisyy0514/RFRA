@@ -252,10 +252,10 @@ const App: React.FC = () => {
         {activeTab === 'settings' && (
           <div className="max-w-2xl space-y-6">
             <div className="bg-slate-800 p-6 rounded-xl border border-slate-700">
-              <h2 className="text-lg font-semibold text-white mb-4">Gemini AI 模型配置</h2>
+              <h2 className="text-lg font-semibold text-white mb-4">DeepSeek AI 模型配置</h2>
               <div className="p-4 bg-indigo-500/10 border border-indigo-500/20 rounded-lg">
                 <p className="text-sm text-indigo-200">
-                  系统当前由 <strong>Gemini 3 Pro</strong> 驱动。API 密钥已通过系统环境变量安全配置。
+                  系统当前由 <strong>DeepSeek-V3</strong> 驱动。API 密钥已通过系统环境变量安全配置。
                 </p>
               </div>
             </div>

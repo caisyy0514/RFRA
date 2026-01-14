@@ -81,12 +81,12 @@ app.all('/api/proxy/*', async (req, res) => {
   }
 });
 
-// Serve Static Files (Frontend)
-app.use(express.static(__dirname));
+// Serve Static Files (Frontend) - POINT TO DIST
+app.use(express.static(path.join(__dirname, 'dist')));
 
-// Fallback for SPA routing
+// Fallback for SPA routing - Serve index.html from DIST
 app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
+  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 
 app.listen(PORT, () => {

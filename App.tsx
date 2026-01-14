@@ -19,7 +19,7 @@ const App: React.FC = () => {
   const [assets, setAssets] = useState<Asset[]>([]);
   const [marketData, setMarketData] = useState<TickerData[]>([]);
   const [positions, setPositions] = useState<Position[]>([]);
-  const [instruments, setInstruments] = useState<Instrument[]>([]); // 存储合约面值信息
+  const [instruments, setInstruments] = useState<Instrument[]>([]); 
   const [totalEquity, setTotalEquity] = useState<number>(0);
   const [strategies, setStrategies] = useState<StrategyConfig[]>(DEFAULT_STRATEGIES);
   const [logs, setLogs] = useState<LogEntry[]>(MOCK_LOGS_INIT);
@@ -47,15 +47,29 @@ const App: React.FC = () => {
     }]);
   };
 
-  // Initialization
+  // Initialization & Risk Checks
   useEffect(() => {
     okxService.setConfig(okxConfig);
     
-    if (okxConfig.apiKey) {
-        fetchData();
-        // Fetch instruments metadata once (contract values usually don't change often)
-        okxService.getInstruments('SWAP').then(setInstruments).catch(console.error);
-    }
+    const init = async () => {
+        if (okxConfig.apiKey) {
+            // 1. Account Config Check
+            const isConfigValid = await okxService.checkAccountConfiguration();
+            if (!isConfigValid) {
+                addLog('error', 'SYSTEM', '账户风险警告：请确保 OKX 账户处于“单币种保证金”或“跨币种保证金”模式，否则无法利用现货抵押空单！');
+            } else {
+                addLog('info', 'SYSTEM', '账户模式检查通过 (Single/Multi Currency Margin)。');
+            }
+
+            // 2. Fetch Instruments
+            okxService.getInstruments('SWAP').then(setInstruments).catch(console.error);
+            
+            // 3. Initial Data
+            fetchData();
+        }
+    };
+    
+    init();
     
     const interval = setInterval(fetchData, 5000); 
     return () => clearInterval(interval);
@@ -67,7 +81,7 @@ const App: React.FC = () => {
 
       const [newAssets, newRates, newPositions] = await Promise.all([
         okxService.getAccountAssets(),
-        okxService.getFundingRates(),
+        okxService.getFundingRates(), // Keep fetching watchlist for dashboard visualization
         okxService.getPositions()
       ]);
       setAssets(newAssets);
@@ -78,21 +92,18 @@ const App: React.FC = () => {
       setTotalEquity(equity);
     } catch (e) {
        console.error(e);
-       if (okxConfig.apiKey) {
-         addLog('error', 'OKX', `获取数据失败: ${e instanceof Error ? e.message : '未知错误'}`);
-       }
     }
   };
 
   // Main Strategy Loop references
   const strategiesRef = useRef(strategies);
-  const marketDataRef = useRef(marketData);
+  const positionsRef = useRef(positions);
   const instrumentsRef = useRef(instruments);
   const deepseekKeyRef = useRef(deepseekKey);
   const totalEquityRef = useRef(totalEquity);
 
   useEffect(() => { strategiesRef.current = strategies; }, [strategies]);
-  useEffect(() => { marketDataRef.current = marketData; }, [marketData]);
+  useEffect(() => { positionsRef.current = positions; }, [positions]);
   useEffect(() => { instrumentsRef.current = instruments; }, [instruments]);
   useEffect(() => { deepseekKeyRef.current = deepseekKey; }, [deepseekKey]);
   useEffect(() => { totalEquityRef.current = totalEquity; }, [totalEquity]);
@@ -104,111 +115,147 @@ const App: React.FC = () => {
       const activeStrats = strategiesRef.current.filter(s => s.isActive);
       
       for (const strategy of activeStrats) {
-        const scanInterval = (strategy.parameters.scanIntervalEmpty || 60) * 1000;
+        const scanInterval = (strategy.parameters.scanInterval || 60) * 1000;
         const timeSinceLastRun = Date.now() - (strategy.lastRun || 0);
 
         if (timeSinceLastRun >= scanInterval) {
-           await executeStrategy(strategy);
+           await executeOptimizedStrategy(strategy);
         }
       }
 
       timeoutId = setTimeout(runLoop, 1000); 
     };
 
-    const executeStrategy = async (strategy: StrategyConfig) => {
-        addLog('info', 'STRATEGY', `正在评估策略: ${strategy.name}...`);
+    /**
+     * CORE STRATEGY ENGINE
+     * Implements: Scanner -> Monitor -> Rotation -> Execution
+     */
+    const executeOptimizedStrategy = async (strategy: StrategyConfig) => {
+        addLog('info', 'STRATEGY', `[Cycle Start] 执行策略: ${strategy.name}`);
         
-        let currentAnalysis: AIAnalysisResult | null = null;
+        // --- Phase 1: Scanner (全市场扫描) ---
+        addLog('info', 'STRATEGY', '正在扫描全市场合约及资金费率...');
+        
+        // 1. Get All Tickers to filter by Volume
+        const allTickers = await okxService.getMarketTickers();
+        const minVol = strategy.parameters.minVolume24h || 10000000;
+        
+        // 2. Filter High Liquidity
+        const liquidTickers = allTickers.filter(t => 
+            t.instId.endsWith('-USDT-SWAP') && 
+            parseFloat(t.volCcy24h) > minVol
+        );
 
-        // 1. AI Analysis Step
-        if (strategy.parameters.useAI) {
-           addLog('info', 'AI', '正在请求 DeepSeek 进行市场分析...');
-           // Note: analyzeMarketConditions now contains the "Guardian" logic to block negative rates
-           currentAnalysis = await analyzeMarketConditions(marketDataRef.current, strategy.name, deepseekKeyRef.current);
-           setLastAnalysis(currentAnalysis);
-           
-           if (currentAnalysis.recommendedAction === 'ERROR' || currentAnalysis.recommendedAction === 'WAIT') {
-              if (currentAnalysis.reasoning) {
-                  const level = currentAnalysis.recommendedAction === 'ERROR' ? 'error' : 'info';
-                  addLog(level, 'AI', currentAnalysis.reasoning);
-              }
-              updateStrategyLastRun(strategy.id);
-              return;
-           } else {
-              addLog('success', 'AI', `AI 分析完成，建议: ${currentAnalysis.recommendedAction} (风险评分: ${currentAnalysis.riskScore})。`);
-           }
-
-           if(currentAnalysis.riskScore > 80) {
-             addLog('warning', 'STRATEGY', `检测到高风险 (${currentAnalysis.riskScore})，触发风控熔断，跳过执行。`);
-             updateStrategyLastRun(strategy.id);
-             return;
-           }
+        if (liquidTickers.length === 0) {
+            addLog('warning', 'STRATEGY', '市场流动性不足，未找到满足成交量要求的币种。');
+            updateStrategyLastRun(strategy.id);
+            return;
         }
 
-        // 2. Execution Logic
-        if (currentAnalysis && (currentAnalysis.recommendedAction === 'BUY' || currentAnalysis.recommendedAction === 'SELL')) {
-            const action = currentAnalysis.recommendedAction;
-            const pairsToTrade = currentAnalysis.suggestedPairs || [];
-            
-            if (pairsToTrade.length === 0) {
-                addLog('warning', 'STRATEGY', 'AI 建议交易但未提供具体币对，跳过执行。');
-            } else {
-                const allocationPct = strategy.parameters.allocationPct || 50;
-                const totalEq = totalEquityRef.current;
-                const safeEquity = totalEq > 0 ? totalEq : 10000; 
+        // 3. Batch Fetch Funding Rates for Top Candidates (Limit to top 30 by Vol to save API)
+        // In production, we might use a dedicated monitor service.
+        const candidatesToCheck = liquidTickers
+            .sort((a, b) => parseFloat(b.volCcy24h) - parseFloat(a.volCcy24h))
+            .slice(0, 30);
+        
+        const candidatesWithRates = [];
+        for (const cand of candidatesToCheck) {
+            const rate = await okxService.getFundingRate(cand.instId);
+            if (parseFloat(rate) > 0) { // Only care about positive rates
+                candidatesWithRates.push({ ...cand, fundingRate: rate });
+            }
+        }
 
-                const targetUsdSize = safeEquity * (allocationPct / 100);
-                const perPairUsdSize = targetUsdSize / pairsToTrade.length;
+        // 4. Sort by Funding Rate (High to Low)
+        const sortedCandidates = candidatesWithRates
+            .sort((a, b) => parseFloat(b.fundingRate) - parseFloat(a.fundingRate));
 
-                for (const pair of pairsToTrade) {
-                    try {
-                        const marketTicker = marketDataRef.current.find(m => m.instId === pair);
-                        const instrumentInfo = instrumentsRef.current.find(i => i.instId === pair);
+        const topCandidate = sortedCandidates[0]; // The King
+        const minRateThreshold = strategy.parameters.minFundingRate || 0.0003;
 
-                        if (!marketTicker) {
-                             addLog('error', 'STRATEGY', `无法获取 ${pair} 的最新价格，跳过下单。`);
-                             continue;
+        if (!topCandidate || parseFloat(topCandidate.fundingRate) < minRateThreshold) {
+             addLog('info', 'STRATEGY', `当前市场无高收益机会 (Max: ${topCandidate?.fundingRate || 0} < Threshold: ${minRateThreshold})`);
+             // Continue to Monitor phase anyway to check if we need to close existing bad positions
+        } else {
+             addLog('success', 'STRATEGY', `发现最佳标的: ${topCandidate.instId} (Rate: ${(parseFloat(topCandidate.fundingRate)*100).toFixed(4)}%, Vol: ${(parseFloat(topCandidate.volCcy24h)/1000000).toFixed(1)}M)`);
+        }
+
+        // --- Phase 2: Monitor & Rotation (监控与轮动) ---
+        const currentPositions = positionsRef.current;
+        const currentHolding = currentPositions.find(p => parseInt(p.pos) !== 0); // Assuming 1 active arb pair for simplicity
+
+        // A. Check Exit / Rotation Conditions
+        if (currentHolding) {
+            const holdingRate = await okxService.getFundingRate(currentHolding.instId);
+            const exitThreshold = strategy.parameters.exitThreshold || 0.0001;
+            const rotationThreshold = strategy.parameters.rotationThreshold || 0.0002;
+
+            // Condition 1: Rate turned bad (Absolute Exit)
+            if (parseFloat(holdingRate) < exitThreshold) {
+                addLog('warning', 'STRATEGY', `[EXIT] 持仓 ${currentHolding.instId} 费率恶化 (${holdingRate} < ${exitThreshold})。执行清仓。`);
+                const instInfo = instrumentsRef.current.find(i => i.instId === currentHolding.instId);
+                if (instInfo) await okxService.executeDualSideExit(currentHolding.instId, instInfo, currentHolding.pos);
+                updateStrategyLastRun(strategy.id);
+                return; // End cycle, wait for next to enter new
+            }
+
+            // Condition 2: Better opportunity found (Rotation)
+            if (topCandidate && topCandidate.instId !== currentHolding.instId) {
+                const rateDiff = parseFloat(topCandidate.fundingRate) - parseFloat(holdingRate);
+                if (rateDiff > rotationThreshold) {
+                    addLog('info', 'STRATEGY', `[ROTATION] 发现更优标的。${topCandidate.instId} (${topCandidate.fundingRate}) 比 ${currentHolding.instId} (${holdingRate}) 高出 ${rateDiff.toFixed(5)}。执行轮动。`);
+                    const instInfo = instrumentsRef.current.find(i => i.instId === currentHolding.instId);
+                    if (instInfo) {
+                        const exitRes = await okxService.executeDualSideExit(currentHolding.instId, instInfo, currentHolding.pos);
+                        if (exitRes.success) {
+                            addLog('success', 'STRATEGY', '旧仓位已平，准备在新一轮循环中建仓新币种。');
                         }
-                        
-                        if (!instrumentInfo) {
-                             addLog('error', 'STRATEGY', `无法获取 ${pair} 的合约元数据(面值)，跳过下单。请检查网络或重启。`);
-                             continue;
-                        }
-
-                        // --- 最终安全检查 (Final Safety Check) ---
-                        // 即使 deepseekService 已经检查过了，我们在下单前最后一刻再查一次
-                        if (parseFloat(marketTicker.fundingRate) <= 0) {
-                             addLog('error', 'STRATEGY', `[FATAL] 拦截下单：${pair} 资金费率已变为负值 (${marketTicker.fundingRate})。`);
-                             continue;
-                        }
-
-                        const price = parseFloat(marketTicker.last);
-                        const contractVal = parseFloat(instrumentInfo.ctVal); // e.g., 0.01 BTC
-                        
-                        // --- 核心修复：计算张数 (Lots) ---
-                        // 公式：(总USDT金额 / 当前币价) = 目标币数
-                        // 张数 = 目标币数 / 每张合约面值
-                        const targetCoinAmount = perPairUsdSize / price;
-                        const lots = Math.floor(targetCoinAmount / contractVal);
-
-                        if (lots < 1) {
-                            addLog('warning', 'STRATEGY', `${pair} 资金不足以购买最小一张合约 (Min: 1, Calc: ${lots})。`);
-                            continue;
-                        }
-
-                        addLog('info', 'STRATEGY', `正在执行: ${action} ${pair}, 目标金额: $${perPairUsdSize.toFixed(2)} (Calc: ${lots} 张 @ 面值 ${contractVal})`);
-
-                        await okxService.placeOrder(pair, action.toLowerCase() as 'buy' | 'sell', lots.toString());
-                        
-                        addLog('success', 'OKX', `订单已提交: ${pair} ${action} ${lots}张`);
-
-                    } catch (e) {
-                        addLog('error', 'STRATEGY', `下单失败 (${pair}): ${e instanceof Error ? e.message : 'Unknown Error'}`);
                     }
+                    updateStrategyLastRun(strategy.id);
+                    return;
                 }
             }
-        } else {
-            addLog('info', 'STRATEGY', '根据 AI 建议 (HOLD/WAIT)，无交易操作。');
+            
+            addLog('info', 'STRATEGY', `持仓 ${currentHolding.instId} 状态良好 (Rate: ${holdingRate})。继续持有。`);
+        }
+
+        // --- Phase 3: Entry (建仓) ---
+        // Only enter if we have no positions (or just closed them) and a good candidate exists
+        if (!currentHolding && positionsRef.current.length === 0 && topCandidate && parseFloat(topCandidate.fundingRate) >= minRateThreshold) {
+            
+            // AI Check (Sentiment Filter)
+            if (strategy.parameters.useAI) {
+                const analysis = await analyzeMarketConditions([topCandidate], strategy.name, deepseekKeyRef.current);
+                setLastAnalysis(analysis);
+                if (analysis.recommendedAction === 'WAIT' || analysis.recommendedAction === 'SELL') {
+                    addLog('warning', 'AI', `AI 建议观望 ${topCandidate.instId} (${analysis.reasoning})。暂停建仓。`);
+                    updateStrategyLastRun(strategy.id);
+                    return;
+                }
+            }
+
+            const allocationPct = strategy.parameters.allocationPct || 50;
+            const totalEq = totalEquityRef.current;
+            const investAmount = (totalEq * (allocationPct / 100)); // Total USD for this pair (Spot + Margin)
+            
+            // For Cash & Carry: We buy Spot with 50% of allocation, hold Short with collateral
+            // Actually, usually we use ~95% of equity to buy Spot, and use that spot as collateral to short 1x.
+            // Let's assume we use 'investAmount' to Buy Spot.
+            
+            const instrumentInfo = instrumentsRef.current.find(i => i.instId === topCandidate.instId);
+            if (!instrumentInfo) {
+                addLog('error', 'STRATEGY', `无法获取 ${topCandidate.instId} 元数据。`);
+                return;
+            }
+
+            addLog('info', 'STRATEGY', `[ENTRY] 准备建仓 ${topCandidate.instId}。金额: $${investAmount.toFixed(0)}`);
+            const res = await okxService.executeDualSideEntry(topCandidate.instId, investAmount, instrumentInfo);
+            
+            if (res.success) {
+                addLog('success', 'STRATEGY', res.message);
+            } else {
+                addLog('error', 'STRATEGY', res.message);
+            }
         }
 
         updateStrategyLastRun(strategy.id);

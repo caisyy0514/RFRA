@@ -1,3 +1,4 @@
+
 import { StrategyConfig, StrategyType, LogEntry } from './types';
 
 export const DEFAULT_STRATEGIES: StrategyConfig[] = [
@@ -7,14 +8,14 @@ export const DEFAULT_STRATEGIES: StrategyConfig[] = [
     type: StrategyType.ROTATIONAL_FUNDING,
     isActive: false,
     parameters: {
-      minFundingRate: 0.0001, // 0.01% per 8h
-      rebalanceInterval: 60, // minutes
-      maxLeverage: 1, // Delta neutral
-      excludedCoins: ['USDC', 'DAI'],
-      allocationPct: 50, // % of total portfolio
+      minFundingRate: 0.0003, // 0.03% (approx 32% APY)
+      minVolume24h: 10000000, // 10 Million USDT liquidity required
+      rotationThreshold: 0.0002, // New rate must be 0.02% higher than current to switch (cover fees)
+      exitThreshold: 0.0001, // Exit if rate drops below 0.01%
+      allocationPct: 50, // Use 50% of available equity
+      maxPositions: 1, // Focus on the single best yielder for this demo
       useAI: true,
-      scanIntervalEmpty: 60, // seconds
-      scanIntervalHolding: 20 // seconds
+      scanInterval: 60, // 1 minute
     },
     lastRun: 0
   }

@@ -22,7 +22,17 @@ export interface StrategyConfig {
   name: string;
   type: StrategyType;
   isActive: boolean;
-  parameters: Record<string, any>;
+  parameters: {
+    minFundingRate: number; // e.g. 0.0003
+    minVolume24h: number; // e.g. 10,000,000
+    rotationThreshold: number; // e.g. 0.0002 (Diff required to rotate)
+    exitThreshold: number; // e.g. 0.0001
+    allocationPct: number;
+    maxPositions: number;
+    useAI: boolean;
+    scanInterval: number; // seconds
+    [key: string]: any;
+  };
   lastRun?: number;
 }
 
@@ -30,11 +40,14 @@ export interface TickerData {
   instId: string;
   last: string;
   fundingRate: string; // Next funding rate
+  volCcy24h: string; // 24h Volume in USD
   ts: string;
 }
 
 export interface Instrument {
   instId: string;
+  baseCcy: string;
+  quoteCcy: string;
   ctVal: string; // Contract value (e.g., "0.01" for BTC)
   minSz: string; // Minimum order size (e.g., "1")
   tickSz: string; // Price tick size

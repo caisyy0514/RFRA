@@ -28,7 +28,7 @@ const StrategyManager: React.FC<StrategyManagerProps> = ({ strategies, onToggleS
   const handleSave = () => {
     if (!editingId) return;
     try {
-      let finalParams = {};
+      let finalParams: any = {};
       
       if (mode === 'json') {
         finalParams = JSON.parse(jsonParams);

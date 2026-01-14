@@ -162,8 +162,12 @@ const App: React.FC = () => {
             const newEntries = finalTradeQueue.filter(t => !updatedPos.some(p => p.instId === t.instId)).slice(0, slots);
 
             for (const target of newEntries) {
+                // 核心修复：引入随机延时 (抖动)，避开并发报错
+                await new Promise(r => setTimeout(r, Math.random() * 800 + 1000));
+                
                 const investAmt = (totalEquityRef.current * (strategy.parameters.allocationPct || 30) / 100);
                 const swapInfo = instrumentsRef.current.find(i => i.instId === target.instId);
+                
                 if (swapInfo) {
                     addLog('info', 'STRATEGY', `[执行入场] 标的: ${target.instId}, 分配金额: $${investAmt.toFixed(2)}`);
                     const res = await okxService.executeDualSideEntry(target.instId, investAmt, swapInfo);

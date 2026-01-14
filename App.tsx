@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { LayoutDashboard, Settings, Layers, Zap, PlayCircle, List, Eye } from 'lucide-react';
+import { LayoutDashboard, Settings, Layers, Zap, PlayCircle, List, Eye, Lock } from 'lucide-react';
 import { okxService } from './services/okxService';
 import { analyzeMarketConditions } from './services/deepseekService';
 import Dashboard from './components/Dashboard';
@@ -21,6 +21,9 @@ const App: React.FC = () => {
   const [logs, setLogs] = useState<LogEntry[]>(MOCK_LOGS_INIT);
   const [lastAnalysis, setLastAnalysis] = useState<AIAnalysisResult | null>(null);
   const [isAnalysisModalOpen, setIsAnalysisModalOpen] = useState(false);
+  
+  // DeepSeek API Key State
+  const [deepseekKey, setDeepseekKey] = useState<string>(localStorage.getItem('deepseek_key') || '');
   
   const [okxConfig, setOkxConfig] = useState<OKXConfig>({
     apiKey: '',
@@ -80,11 +83,16 @@ const App: React.FC = () => {
   const positionsRef = useRef(positions);
   const instrumentsRef = useRef(instruments);
   const totalEquityRef = useRef(totalEquity);
+  const deepseekKeyRef = useRef(deepseekKey);
 
   useEffect(() => { strategiesRef.current = strategies; }, [strategies]);
   useEffect(() => { positionsRef.current = positions; }, [positions]);
   useEffect(() => { instrumentsRef.current = instruments; }, [instruments]);
   useEffect(() => { totalEquityRef.current = totalEquity; }, [totalEquity]);
+  useEffect(() => { 
+    deepseekKeyRef.current = deepseekKey; 
+    localStorage.setItem('deepseek_key', deepseekKey);
+  }, [deepseekKey]);
 
   useEffect(() => {
     let timeoutId: any;
@@ -179,7 +187,7 @@ const App: React.FC = () => {
                 const candidate = entryList[i];
                 
                 if (strategy.parameters.useAI) {
-                    const analysis = await analyzeMarketConditions([candidate], strategy.name);
+                    const analysis = await analyzeMarketConditions([candidate], strategy.name, deepseekKeyRef.current);
                     setLastAnalysis(analysis);
                     if (analysis.recommendedAction !== 'BUY') {
                         addLog('warning', 'AI', `AI 拒绝入场 ${candidate.instId}: ${analysis.reasoning}`);
@@ -251,21 +259,58 @@ const App: React.FC = () => {
         {activeTab === 'strategies' && <StrategyManager strategies={strategies} onToggleStrategy={toggleStrategy} onUpdateStrategy={updateStrategy} />}
         {activeTab === 'settings' && (
           <div className="max-w-2xl space-y-6">
-            <div className="bg-slate-800 p-6 rounded-xl border border-slate-700">
-              <h2 className="text-lg font-semibold text-white mb-4">DeepSeek AI 模型配置</h2>
-              <div className="p-4 bg-indigo-500/10 border border-indigo-500/20 rounded-lg">
-                <p className="text-sm text-indigo-200">
-                  系统当前由 <strong>DeepSeek-V3</strong> 驱动。API 密钥已通过系统环境变量安全配置。
-                </p>
+            <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-xl">
+              <div className="flex items-center justify-between mb-6">
+                <h2 className="text-xl font-bold text-white flex items-center gap-2">
+                   DeepSeek AI 模型配置
+                </h2>
+                <span className="bg-blue-600/20 text-blue-400 text-[10px] px-2 py-0.5 rounded border border-blue-500/30 uppercase font-bold">DeepSeek-V3</span>
+              </div>
+              
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest mb-2 flex items-center gap-1.5">
+                    <Lock className="w-3 h-3" /> API 密钥 (API Key)
+                  </label>
+                  <input 
+                    type="password" 
+                    placeholder="sk-..." 
+                    value={deepseekKey} 
+                    onChange={(e) => setDeepseekKey(e.target.value)} 
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-white focus:outline-none focus:border-blue-500 transition-colors shadow-inner font-mono text-sm" 
+                  />
+                  <p className="mt-2 text-[10px] text-slate-500 leading-relaxed italic">
+                    注意：API 密钥仅存储在您的浏览器本地存储 (LocalStorage) 中。系统绝不会将该密钥上传至除 DeepSeek 官方 API 接口以外的任何位置。
+                  </p>
+                </div>
               </div>
             </div>
-            <div className="bg-slate-800 p-6 rounded-xl border border-slate-700">
-              <h2 className="text-lg font-semibold text-white mb-4">OKX V5 配置</h2>
-              <div className="flex items-center gap-2 mb-4"><input type="checkbox" checked={okxConfig.isSimulated} onChange={(e) => setOkxConfig({...okxConfig, isSimulated: e.target.checked})} /><label className="text-sm text-white">启用模拟盘</label></div>
+
+            <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-xl">
+              <h2 className="text-xl font-bold text-white mb-6">OKX V5 交易所连接</h2>
+              <div className="flex items-center gap-3 mb-6 bg-slate-900/50 p-3 rounded-lg border border-slate-700/50">
+                <input 
+                  type="checkbox" 
+                  id="sim-mode"
+                  checked={okxConfig.isSimulated} 
+                  onChange={(e) => setOkxConfig({...okxConfig, isSimulated: e.target.checked})} 
+                  className="w-4 h-4 rounded border-slate-700 bg-slate-950 text-blue-600 focus:ring-blue-600"
+                />
+                <label htmlFor="sim-mode" className="text-sm text-slate-300 font-medium">启用模拟盘 (Simulation Mode)</label>
+              </div>
               <div className="space-y-4">
-                <input type="text" placeholder="API Key" value={okxConfig.apiKey} onChange={(e) => setOkxConfig({...okxConfig, apiKey: e.target.value})} className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white" />
-                <input type="password" placeholder="Secret Key" value={okxConfig.secretKey} onChange={(e) => setOkxConfig({...okxConfig, secretKey: e.target.value})} className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white" />
-                <input type="password" placeholder="Passphrase" value={okxConfig.passphrase} onChange={(e) => setOkxConfig({...okxConfig, passphrase: e.target.value})} className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white" />
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1.5">API Key</label>
+                  <input type="text" placeholder="Enter OKX API Key" value={okxConfig.apiKey} onChange={(e) => setOkxConfig({...okxConfig, apiKey: e.target.value})} className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-white focus:outline-none focus:border-blue-500 transition-colors font-mono text-sm" />
+                </div>
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1.5">Secret Key</label>
+                  <input type="password" placeholder="Enter OKX Secret Key" value={okxConfig.secretKey} onChange={(e) => setOkxConfig({...okxConfig, secretKey: e.target.value})} className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-white focus:outline-none focus:border-blue-500 transition-colors font-mono text-sm" />
+                </div>
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1.5">Passphrase</label>
+                  <input type="password" placeholder="Enter OKX Passphrase" value={okxConfig.passphrase} onChange={(e) => setOkxConfig({...okxConfig, passphrase: e.target.value})} className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-white focus:outline-none focus:border-blue-500 transition-colors font-mono text-sm" />
+                </div>
               </div>
             </div>
           </div>

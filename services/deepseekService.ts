@@ -6,15 +6,13 @@ import { AIAnalysisResult, TickerData } from '../types';
  */
 export const analyzeMarketConditions = async (
   marketData: TickerData[],
-  strategyName: string
+  strategyName: string,
+  apiKey: string
 ): Promise<AIAnalysisResult> => {
-  // 从环境变量获取 API Key
-  const apiKey = process.env.API_KEY;
-
   if (!apiKey) {
     return {
       recommendedAction: "ERROR",
-      reasoning: "未配置 AI API Key，请检查系统环境变量。",
+      reasoning: "未配置 DeepSeek API Key，请前往设置面板配置。",
       riskScore: 0,
       suggestedPairs: []
     };

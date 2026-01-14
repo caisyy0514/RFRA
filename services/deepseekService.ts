@@ -37,7 +37,8 @@ export const analyzeMarketConditions = async (
           instId: t.instId,
           fundingRate: `${(parseFloat(t.fundingRate)*100).toFixed(4)}%`,
           turnoverUsdt24h: `$${(parseFloat(t.volUsdt24h) / 1e6).toFixed(2)}M`,
-          lastPrice: t.last
+          lastPrice: t.last,
+          isMainstream: t.instId.startsWith('BTC-') || t.instId.startsWith('ETH-')
       }));
 
   try {
@@ -45,17 +46,19 @@ export const analyzeMarketConditions = async (
       你是一个量化加密货币交易专家。请分析策略 "${strategyName}" 的市场数据。
       策略逻辑: 期现套利 (赚取资金费率)。
       
-      铁律:
-      1. 必须资金费率 > 0。
-      2. 标的流动性必须充足 (通常 > 5M USDT)。
-      3. 若成交额异常巨大 (如 > 50B USDT)，请警惕异常，返回 WAIT。
+      风控铁律 (Risk Control Rules):
+      1. 资金费率必须为正 (Funding Rate > 0)。
+      2. 基础流动性必须满足 (通常 > 5M USDT)。
+      3. 动态异常成交额预警:
+         - 对于 BTC 和 ETH: 成交额在 10B - 500B USDT 之间属于高度流动性的正常区间。只有当成交额较往日平均水平出现 5 倍以上爆发式增长且伴随剧烈波动时才需标记为 WAIT。
+         - 对于其他山寨币 (Altcoins): 若 24h 成交额 > 50B USDT，通常暗示存在极端行情或操纵风险，应返回 WAIT。
 
       待分析数据:
       ${JSON.stringify(formattedCandidates)}
 
       请以 JSON 格式返回结果，包含以下字段：
-      - recommendedAction: "BUY", "SELL", "HOLD", "WAIT"
-      - reasoning: 中文逻辑分析
+      - recommendedAction: "BUY" (推荐入场), "SELL" (建议离场), "HOLD" (观望), "WAIT" (风险警告)
+      - reasoning: 详细的逻辑分析（中文），需解释为何放宽或收紧对主流币/山寨币的成交额限制。
       - riskScore: 0-100 风险分
       - suggestedPairs: 推荐的币种 ID 数组
     `;
@@ -94,7 +97,7 @@ export const analyzeMarketConditions = async (
        if (invalidPairs.length > 0) {
           return {
             recommendedAction: "WAIT",
-            reasoning: `风控拦截：DeepSeek 推荐了费率为负或不存在的币种 (${invalidPairs.join(', ')})。`,
+            reasoning: `风控拦截：AI 推荐了费率为负或不存在的币种 (${invalidPairs.join(', ')})。`,
             riskScore: 100,
             suggestedPairs: []
           };

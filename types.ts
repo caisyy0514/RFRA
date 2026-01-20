@@ -21,7 +21,8 @@ export interface StrategyConfig {
   id: string;
   name: string;
   type: StrategyType;
-  isActive: boolean;
+  isActive: boolean; // Radar Switch (Monitoring only)
+  isTrading: boolean; // Execution Switch (Allows actual orders)
   parameters: {
     minFundingRate: number; // e.g. 0.0003
     minVolume24h: number; // e.g. 10,000,000

@@ -97,11 +97,11 @@ const App: React.FC = () => {
         const isConfigValid = await okxService.checkAccountConfiguration();
         if (!isConfigValid) {
             addLog('error', 'STRATEGY', '策略拦截：账户模式不兼容，请切换为“跨币种保证金模式”后再启动。');
-            toggleStrategy(strategy.id);
+            toggleStrategy(strategy.id, 'isActive');
             return;
         }
 
-        addLog('info', 'STRATEGY', `[引擎轮询] 正在扫描全市场可用标的并计算实时收益率...`);
+        addLog('info', 'STRATEGY', `[雷达扫描] 正在全市场搜寻套利机会...`);
         
         const [allTickers, spotInsts] = await Promise.all([
           okxService.getMarketTickers(),
@@ -130,7 +130,7 @@ const App: React.FC = () => {
         }
 
         if (topCandidates.length === 0) {
-            addLog('warning', 'STRATEGY', '扫描结束：当前市场未发现满足费率阈值且流动性充足的对冲标的。');
+            addLog('info', 'STRATEGY', '扫描结束：当前市场暂无高收益标的。');
             updateStrategyLastRun(strategy.id);
             return;
         }
@@ -143,9 +143,9 @@ const App: React.FC = () => {
                 finalTradeQueue = analysis.suggestedPairs
                     .map(pair => topCandidates.find(t => t.instId === pair))
                     .filter((t): t is TickerData => !!t);
-                addLog('success', 'AI', `AI 深度评估通过：已核准入场队列，包含 ${finalTradeQueue.length} 个低风险高收益标的。`);
+                addLog('success', 'AI', `AI 审核通过：发现 ${finalTradeQueue.length} 个优质标的。`);
             } else {
-                addLog('warning', 'AI', `AI 拦截入场：${analysis.reasoning}`);
+                addLog('warning', 'AI', `AI 建议观望：${analysis.reasoning}`);
                 updateStrategyLastRun(strategy.id);
                 return;
             }
@@ -155,7 +155,11 @@ const App: React.FC = () => {
         for (const pos of currentPositions) {
             const currentRate = parseFloat(await okxService.getFundingRate(pos.instId));
             if (currentRate < (strategy.parameters.exitThreshold || 0.0001)) {
-                addLog('warning', 'STRATEGY', `[退出逻辑触发] ${pos.instId} 当前费率 ${(currentRate*100).toFixed(4)}% 低于清算阈值，执行平仓对冲。`);
+                if (!strategy.isTrading) {
+                    addLog('warning', 'STRATEGY', `[模拟信号] ${pos.instId} 费率降至 ${(currentRate*100).toFixed(4)}%，触发出场条件 (交易开关关闭)。`);
+                    continue;
+                }
+                addLog('warning', 'STRATEGY', `[退出执行] ${pos.instId} 费率低，执行平仓。`);
                 const instInfo = instrumentsRef.current.find(i => i.instId === pos.instId);
                 if (instInfo) await okxService.executeDualSideExit(pos.instId, instInfo, pos.pos);
             }
@@ -169,33 +173,32 @@ const App: React.FC = () => {
             const slots = maxPos - activeCount;
             const newEntries = finalTradeQueue.filter(t => !updatedPos.some(p => p.instId === t.instId)).slice(0, slots);
 
-            // [逻辑重构] 本地资金池计数器：使用实际 USDT 现金余额
             const usdtAsset = assetsRef.current.find(a => a.currency === 'USDT');
             let remainingUsdtCash = usdtAsset ? usdtAsset.available : 0;
             const allocationPct = strategy.parameters.allocationPct || 30;
 
             for (const target of newEntries) {
-                // 增加抖动延时，确保保证金引擎同步
-                await new Promise(r => setTimeout(r, Math.random() * 2000 + 3000));
-                
-                // [逻辑重构] 分配基数切换为 USDT 现金，并应用 0.95 安全护城河
                 const investAmt = (remainingUsdtCash * (allocationPct / 100)) * 0.95;
                 const swapInfo = instrumentsRef.current.find(i => i.instId === target.instId);
                 
                 if (swapInfo && investAmt > 20) {
-                    addLog('info', 'STRATEGY', `[入场决策] 标的: ${target.instId}, 拟分配 USDT 现金: $${investAmt.toFixed(2)} (账户余现: $${remainingUsdtCash.toFixed(2)})`);
+                    if (!strategy.isTrading) {
+                        addLog('info', 'STRATEGY', `[模拟入场] 标的: ${target.instId}, 费率: ${(parseFloat(target.fundingRate)*100).toFixed(4)}%, 拟投入: $${investAmt.toFixed(2)} (交易未开启)`);
+                        continue; 
+                    }
+
+                    // 增加抖动延时
+                    await new Promise(r => setTimeout(r, Math.random() * 2000 + 3000));
                     
+                    addLog('info', 'STRATEGY', `[入场决策] 标的: ${target.instId}, 拟分配 USDT: $${investAmt.toFixed(2)}`);
                     const res = await okxService.executeDualSideEntry(target.instId, investAmt, swapInfo);
+                    
                     if (res.success) {
                         addLog('success', 'STRATEGY', res.message);
-                        // 更新本地计数器，防止下一笔订单撞上保证金墙
                         remainingUsdtCash -= investAmt;
                     } else {
                         addLog('error', 'STRATEGY', `执行失败: ${res.message}`);
                     }
-                } else if (investAmt <= 20) {
-                    addLog('warning', 'STRATEGY', `USDT 现金可用量过低 ($${investAmt.toFixed(2)})，停止本轮入场决策。`);
-                    break; // 现金不足，直接终止本轮循环
                 }
             }
         }
@@ -210,7 +213,18 @@ const App: React.FC = () => {
     return () => clearTimeout(timeoutId);
   }, []); 
 
-  const toggleStrategy = (id: string) => setStrategies(prev => prev.map(s => s.id === id ? { ...s, isActive: !s.isActive } : s));
+  const toggleStrategy = (id: string, field: 'isActive' | 'isTrading') => {
+      setStrategies(prev => prev.map(s => {
+          if (s.id !== id) return s;
+          const updated = { ...s, [field]: !s[field] };
+          // Safety logic: If Radar (isActive) is turned off, Execution (isTrading) must also be off
+          if (field === 'isActive' && updated.isActive === false) {
+              updated.isTrading = false;
+          }
+          return updated;
+      }));
+  };
+  
   const updateStrategy = (updated: StrategyConfig) => setStrategies(prev => prev.map(s => s.id === updated.id ? updated : s));
 
   return (

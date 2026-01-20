@@ -1,10 +1,10 @@
 import React, { useState } from 'react';
 import { StrategyConfig } from '../types';
-import { Play, Square, Settings, Cpu, Save, Code, Sliders, Info } from 'lucide-react';
+import { Play, Square, Settings, Cpu, Save, Code, Sliders, Info, Radar, Zap } from 'lucide-react';
 
 interface StrategyManagerProps {
   strategies: StrategyConfig[];
-  onToggleStrategy: (id: string) => void;
+  onToggleStrategy: (id: string, field: 'isActive' | 'isTrading') => void;
   onUpdateStrategy: (strategy: StrategyConfig) => void;
 }
 
@@ -56,31 +56,58 @@ const StrategyManager: React.FC<StrategyManagerProps> = ({ strategies, onToggleS
       {strategies.map((strategy) => (
         <div key={strategy.id} className={`bg-slate-800 rounded-xl border ${strategy.isActive ? 'border-emerald-500/50' : 'border-slate-700'} shadow-lg overflow-hidden transition-all duration-300`}>
           <div className="p-6">
-            <div className="flex justify-between items-start mb-4">
+            <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
               <div className="flex items-center gap-3">
                  <div className={`p-2 rounded-lg ${strategy.isActive ? 'bg-emerald-500/10 text-emerald-400' : 'bg-slate-700 text-slate-400'}`}>
                     <Cpu className="w-6 h-6" />
                  </div>
                  <div>
-                    <h3 className="text-xl font-bold text-white">{strategy.name}</h3>
+                    <h3 className="text-xl font-bold text-white flex items-center gap-2">
+                        {strategy.name}
+                        {strategy.isActive && !strategy.isTrading && (
+                            <span className="text-[10px] px-2 py-0.5 rounded bg-blue-500/20 text-blue-400 border border-blue-500/30">模拟/雷达模式</span>
+                        )}
+                    </h3>
                     <div className="text-xs text-slate-400 uppercase tracking-wider mt-1">{strategy.type.replace('_', ' ')}</div>
                  </div>
               </div>
               
-              <button
-                onClick={() => onToggleStrategy(strategy.id)}
-                className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all transform active:scale-95 ${
-                  strategy.isActive 
-                    ? 'bg-red-500/10 text-red-400 hover:bg-red-500/20' 
-                    : 'bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20'
-                }`}
-              >
-                {strategy.isActive ? (
-                  <> <Square className="w-4 h-4 fill-current" /> 停止策略 </>
-                ) : (
-                  <> <Play className="w-4 h-4 fill-current" /> 启动策略 </>
-                )}
-              </button>
+              <div className="flex items-center gap-3">
+                  {/* Radar Switch */}
+                  <button
+                    onClick={() => onToggleStrategy(strategy.id, 'isActive')}
+                    className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all transform active:scale-95 border ${
+                      strategy.isActive 
+                        ? 'bg-blue-500/10 text-blue-400 border-blue-500/30 hover:bg-blue-500/20' 
+                        : 'bg-slate-700 text-slate-400 border-transparent hover:bg-slate-600'
+                    }`}
+                  >
+                    {strategy.isActive ? (
+                      <> <Radar className="w-4 h-4 animate-spin-slow" /> 雷达运行中 </>
+                    ) : (
+                      <> <Radar className="w-4 h-4" /> 启动雷达 </>
+                    )}
+                  </button>
+
+                  {/* Trading Switch */}
+                  <button
+                    onClick={() => onToggleStrategy(strategy.id, 'isTrading')}
+                    disabled={!strategy.isActive}
+                    className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all transform active:scale-95 border ${
+                        !strategy.isActive 
+                            ? 'opacity-50 cursor-not-allowed bg-slate-800 text-slate-500 border-transparent'
+                            : strategy.isTrading 
+                                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/20' 
+                                : 'bg-slate-700 text-slate-400 border-transparent hover:bg-slate-600'
+                    }`}
+                  >
+                    {strategy.isTrading ? (
+                      <> <Zap className="w-4 h-4 fill-current" /> 交易已允许 </>
+                    ) : (
+                      <> <Square className="w-4 h-4" /> 允许交易 </>
+                    )}
+                  </button>
+              </div>
             </div>
 
             {/* Configuration Area */}

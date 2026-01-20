@@ -7,6 +7,7 @@ export const DEFAULT_STRATEGIES: StrategyConfig[] = [
     name: '多币种资金费率轮动策略',
     type: StrategyType.ROTATIONAL_FUNDING,
     isActive: false,
+    isTrading: false,
     parameters: {
       minFundingRate: 0.0003, // 0.03% (approx 32% APY)
       minVolume24h: 10000000, // 10 Million USDT liquidity required

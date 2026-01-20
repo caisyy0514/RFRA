@@ -18,12 +18,19 @@ export const analyzeMarketConditions = async (
     };
   }
 
-  const formattedCandidates = marketData.map(t => ({
-      instId: t.instId,
-      fundingRate: `${(parseFloat(t.fundingRate)*100).toFixed(4)}%`,
-      turnover24h: `$${(parseFloat(t.volUsdt24h) / 1e6).toFixed(2)}M`,
-      isMainstream: t.instId.startsWith('BTC-') || t.instId.startsWith('ETH-')
-  }));
+  // 定义主流币列表 (Mainstream Coins)
+  const mainstreamCoins = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'OKB'];
+
+  const formattedCandidates = marketData.map(t => {
+      const volumeInMillions = parseFloat(t.volUsdt24h) / 1e6;
+      return {
+          instId: t.instId,
+          fundingRate: `${(parseFloat(t.fundingRate)*100).toFixed(4)}%`,
+          // 关键修改：发送纯数字，单位为百万 (Million)，消除 AI 对字符串 "$900M" 的解析歧义
+          turnoverMillions: parseFloat(volumeInMillions.toFixed(2)), 
+          isMainstream: mainstreamCoins.some(coin => t.instId.startsWith(`${coin}-`))
+      };
+  });
 
   try {
     const prompt = `
@@ -32,10 +39,10 @@ export const analyzeMarketConditions = async (
 
       核心风控铁律:
       1. 资金费率必须为正。
-      2. 基础流动性 (Turnover) 必须 > 5M USDT。
+      2. 基础流动性要求：turnoverMillions (24h成交额/百万U) 必须大于 5。(例如: 974.36 代表 9.74亿，远大于 5，符合条件)。
       3. 动态异常成交额预警:
-         - 对于 BTC 和 ETH (主流币): 24h成交额在 10B - 500B USDT 之间是正常的极高流动性表现。只有当成交额较往日平均水平瞬间喷发 10 倍以上且伴随极端波动时才拦截。
-         - 对于山寨币: 若成交额 > 50B USDT，通常暗示脱钩或操纵，需高度警惕。
+         - 对于 isMainstream=true 的主流币 (BTC, ETH, SOL, BNB, XRP, OKB): 成交额高是流动性好的表现。只有当成交额较往日平均水平瞬间喷发 10 倍以上且伴随极端波动时才拦截。
+         - 对于 isMainstream=false 的山寨币: 若成交额 > 50B USDT (turnoverMillions > 50000)，通常暗示脱钩或操纵，需高度警惕。
 
       待分析标的列表:
       ${JSON.stringify(formattedCandidates)}

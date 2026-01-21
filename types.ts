@@ -53,6 +53,7 @@ export interface Instrument {
   ctVal: string; // Contract value (e.g., "0.01" for BTC)
   minSz: string; // Minimum order size (e.g., "1")
   tickSz: string; // Price tick size
+  lotSz: string; // Lot size (Quantity step size, e.g. "0.000001")
 }
 
 export interface LogEntry {

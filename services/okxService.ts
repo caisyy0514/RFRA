@@ -172,7 +172,6 @@ class OKXService {
         if (!order) continue;
         
         // 状态: live (等待成交), filled (完全成交), canceled (撤单)
-        // 注意: partially_filled 也是 live 状态的一种，但在 OKX API 中通常 state=live, accFillSz > 0
         if (order.state === 'filled') {
             return order;
         }
@@ -191,28 +190,28 @@ class OKXService {
       swapInstrument: Instrument
   ): Promise<{ success: boolean; message: string }> {
       const parts = instId.split('-');
+      const baseCcy = parts[0];
       const spotInstId = `${parts[0]}-${parts[1]}`;
 
       try {
-          // 0. 预检查：获取价格，计算最低资金门槛
+          // 0. 预检查
           const ticker = await this.request(`/api/v5/market/ticker?instId=${instId}`);
           const price = parseFloat(ticker[0]?.last || '0');
           const ctVal = parseFloat(swapInstrument.ctVal);
           
           if (price <= 0) throw new Error("无法获取当前市价");
 
-          // 最小 1 张合约对应的现货价值 + 保证金
           const oneContractValue = ctVal * price;
-          const minRequired = oneContractValue * 2 * 1.05; // 5% 缓冲
+          const minRequired = oneContractValue * 2 * 1.05; // 5% buffer
           
           if (usdtAmount < minRequired) {
               return { 
                   success: false, 
-                  message: `资金不足以开设最小头寸。需 >$${minRequired.toFixed(2)} (1张合约 $${oneContractValue.toFixed(2)} x 2 + buffer), 现有 $${usdtAmount.toFixed(2)}` 
+                  message: `资金不足最小门槛。需 >$${minRequired.toFixed(2)}, 现有 $${usdtAmount.toFixed(2)}` 
               };
           }
 
-          // 1. 强制设置 1x 杠杆 全仓
+          // 1. 强制 1x 杠杆
           await this.setLeverage(instId, '1', 'cross');
 
           const spotInsts = await this.getInstruments('SPOT');
@@ -221,7 +220,6 @@ class OKXService {
 
           // 2. 资金分配
           const spotSpendUsdt = usdtAmount * 0.5;
-          const cashReserveUsdt = usdtAmount * 0.5;
           const safeSpotAmt = (spotSpendUsdt * 0.99).toFixed(2); 
 
           // 3. 买入现货
@@ -237,62 +235,35 @@ class OKXService {
           const spotOrderId = spotOrder[0]?.ordId;
           if (!spotOrderId) throw new Error("Failed to place spot order");
           
-          // 4. 轮询等待成交 (替代死板的 sleep)
+          // 4. 轮询成交
           let filledOrder;
           try {
               filledOrder = await this.pollOrder(spotInstId, spotOrderId);
           } catch (e) {
-              // 若超时，尝试撤单并检查是否部分成交
               console.warn("Spot order timed out, attempting cancel...");
               try { await this.request('/api/v5/trade/cancel-order', 'POST', { instId: spotInstId, ordId: spotOrderId }); } catch(err) {}
-              // 再次查询最终状态
               const finalCheck = await this.request(`/api/v5/trade/order?instId=${spotInstId}&ordId=${spotOrderId}`);
               filledOrder = finalCheck[0];
           }
 
-          const fillSz = parseFloat(filledOrder?.fillSz || '0');
-          if (fillSz <= 0) throw new Error("Spot fill failed: No coins received after polling.");
+          // --- CRITICAL FIX: 使用 accFillSz (累计成交) 而非 fillSz ---
+          const spotQty = parseFloat(filledOrder?.accFillSz || filledOrder?.fillSz || '0');
+          if (spotQty <= 0) throw new Error(`Spot fill failed. accFillSz: ${filledOrder?.accFillSz}`);
 
-          // 5. 计算合约张数
-          const contracts = Math.floor(fillSz / ctVal);
-
-          // -----------------------------------------------------
-          // 关键点：若计算出的张数为 0，说明买入的币不够一张合约
-          // 必须回滚（卖出现货），否则会有裸现货敞口
-          // -----------------------------------------------------
-          if (contracts < 1) {
-             const sellSz = spotInfo ? this.formatByStep(fillSz, spotInfo.minSz) : fillSz.toString();
-             console.warn(`Insufficient coins (${fillSz}) for 1 contract (ctVal ${ctVal}). Rolling back...`);
-             
-             await this.request('/api/v5/trade/order', 'POST', { 
-                 instId: spotInstId, 
-                 tdMode: 'cross', 
-                 side: 'sell', 
-                 ordType: 'market', 
-                 tgtCcy: 'base_ccy', 
-                 sz: sellSz
-             });
-             
-             return { success: false, message: `资金购买量 (${fillSz} ${parts[0]}) 不足 1 张合约 (${ctVal} ${parts[0]}). 已执行自动回滚卖出。` };
-          }
-
-          // 6. 校验保证金是否足够
-          const balData = await this.request('/api/v5/account/balance?ccy=USDT');
-          const usdtAvail = parseFloat(balData[0]?.details?.[0]?.availBal || '0');
-          const estimatedPositionValue = contracts * ctVal * parseFloat(filledOrder.fillPx || price.toString());
+          // 5. 计算张数
+          const contracts = Math.floor(spotQty / ctVal);
           
-          if (usdtAvail < (estimatedPositionValue * 0.98)) { 
-             // 同样的，如果保证金不够，也要回滚现货
-             const sellSz = spotInfo ? this.formatByStep(fillSz, spotInfo.minSz) : fillSz.toString();
+          const mathMsg = `[Hedge Calc] Spot(Acc): ${spotQty}, Face: ${ctVal}, Contracts: ${contracts}`;
+          console.log(mathMsg);
+
+          // 6. 检查是否过小
+          if (contracts < 1) {
+             const sellSz = spotInfo ? this.formatByStep(spotQty, spotInfo.minSz) : spotQty.toString();
+             console.warn(`Insufficient coins (${spotQty}) for 1 contract. Rolling back...`);
              await this.request('/api/v5/trade/order', 'POST', { 
-                 instId: spotInstId, 
-                 tdMode: 'cross', 
-                 side: 'sell', 
-                 ordType: 'market', 
-                 tgtCcy: 'base_ccy', 
-                 sz: sellSz 
+                 instId: spotInstId, tdMode: 'cross', side: 'sell', ordType: 'market', tgtCcy: 'base_ccy', sz: sellSz
              });
-             return { success: false, message: `保证金不足以维持 1x 杠杆 (需 ~$${estimatedPositionValue.toFixed(2)}, 有 $${usdtAvail.toFixed(2)}). 已回滚。` };
+             return { success: false, message: `买入量 ${spotQty} 不足1张合约。已回滚。` };
           }
 
           // 7. 开空合约
@@ -304,13 +275,60 @@ class OKXService {
               sz: contracts.toString()
           });
 
+          // 8. 🛡️ Post-Trade Circuit Breaker (对冲结果熔断校验)
+          // 给予 2秒 使得交易所更新持仓数据
+          await new Promise(r => setTimeout(r, 2000));
+
+          const [latestAssets, latestPositions] = await Promise.all([
+              this.getAccountAssets(),
+              this.getPositions()
+          ]);
+
+          // 获取当前真实持仓数据 (Real-time Reality Check)
+          const spotAsset = latestAssets.find(a => a.currency === baseCcy);
+          const currentSpotBalance = spotAsset ? spotAsset.balance : 0;
+          
+          const swapPos = latestPositions.find(p => p.instId === instId);
+          const currentShortContracts = swapPos ? Math.abs(parseFloat(swapPos.pos)) : 0;
+          const currentHedgedAmount = currentShortContracts * ctVal;
+
+          // 计算全局 Delta 偏差
+          // 理想情况: SpotBalance ≈ HedgedAmount
+          const diff = Math.abs(currentSpotBalance - currentHedgedAmount);
+          const deviation = currentSpotBalance > (ctVal * 5) ? (diff / currentSpotBalance) : 0; // 忽略小额噪音
+
+          if (deviation > 0.05) { // 偏差 > 5%
+              const errMsg = `[CRITICAL RISK] Hedge Deviation ${(deviation*100).toFixed(2)}% > 5%. Spot: ${currentSpotBalance}, Hedged: ${currentHedgedAmount}. EXECUTING EMERGENCY EXIT.`;
+              console.error(errMsg);
+
+              // --- 紧急逃生程序 ---
+              // 1. 市价全平合约
+              if (currentShortContracts > 0) {
+                  await this.request('/api/v5/trade/close-position', 'POST', { instId: instId, mgnMode: 'cross' });
+              }
+              // 2. 市价全卖现货 (清除该币种所有余额)
+              if (currentSpotBalance > 0) {
+                  const sellSz = spotInfo ? this.formatByStep(currentSpotBalance, spotInfo.minSz) : currentSpotBalance.toString();
+                  await this.request('/api/v5/trade/order', 'POST', {
+                      instId: spotInstId,
+                      tdMode: 'cross',
+                      side: 'sell',
+                      ordType: 'market',
+                      tgtCcy: 'base_ccy',
+                      sz: sellSz
+                  });
+              }
+
+              return { success: false, message: errMsg };
+          }
+
           return { 
               success: true, 
-              message: `[1x 完美对冲] 入场成功: 买入 ${fillSz} ${parts[0]} (合约面值 ${ctVal}), 开空 ${contracts} 张。` 
+              message: `[Perfect Hedge] ${mathMsg}. Verified Delta: ${(deviation*100).toFixed(2)}%.` 
           };
 
       } catch (e) {
-          return { success: false, message: `Atomic Entry Failed: ${e instanceof Error ? e.message : 'Unknown'}` };
+          return { success: false, message: `Entry Failed: ${e instanceof Error ? e.message : 'Unknown'}` };
       }
   }
 
@@ -404,6 +422,7 @@ class OKXService {
             state: o.state,
             cTime: parseInt(o.cTime),
             fillSz: o.fillSz,
+            accFillSz: o.accFillSz, // Map accumulated fill size
             fillPx: o.fillPx
         }));
     } catch (e) { return []; }

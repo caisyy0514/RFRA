@@ -94,6 +94,7 @@ export interface Order {
   cTime: number;
   fillSz?: string;
   fillPx?: string;
+  accFillSz?: string; // Accumulated Fill Size (Critical for split orders)
 }
 
 export interface AIAnalysisResult {

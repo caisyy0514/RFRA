@@ -2,7 +2,7 @@ import React, { useMemo, useState, useEffect } from 'react';
 import { Asset, TickerData, StrategyConfig, Position, OKXConfig, Instrument } from '../types';
 import { okxService } from '../services/okxService';
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as ReTooltip, Cell } from 'recharts';
-import { DollarSign, Clock, Server, Wallet, PieChart, Briefcase, TrendingUp, TrendingDown, Scale, RefreshCw, AlertTriangle, CheckCircle } from 'lucide-react';
+import { DollarSign, Clock, Server, Wallet, PieChart, Briefcase, TrendingUp, Scale, RefreshCw, AlertTriangle, CheckCircle, ArrowRightLeft } from 'lucide-react';
 
 interface DashboardProps {
   assets: Asset[];
@@ -80,14 +80,18 @@ const Dashboard: React.FC<DashboardProps> = ({ assets, strategies, marketData, p
           const swapSize = Math.abs(parseFloat(pos.pos)); // contracts
           const swapUPL = parseFloat(pos.upl);
           const swapEntry = parseFloat(pos.avgPx);
+          const swapCoinQty = swapSize * ctVal;
+          const swapValue = swapCoinQty * currentPrice;
           
           // Hedge Delta Calculation
-          const hedgedAmount = swapSize * ctVal;
-          const deltaAmount = spotBalance - hedgedAmount;
+          const deltaAmount = spotBalance - swapCoinQty;
           const deltaValue = deltaAmount * currentPrice;
           
           // Spot Calculations
           const spotValue = spotBalance * currentPrice;
+          // Approximate Spot PnL: (Current - Entry) * Balance
+          // Note: Since we don't track exact Spot Entry in this simple version, we assume Spot Entry ~= Swap Entry for PnL estimation purposes
+          // This shows the "Hedged PnL" logic: Spot gains should offset Swap losses.
           const spotPnL = (currentPrice - swapEntry) * spotBalance;
           
           // Yield Calculations
@@ -106,7 +110,7 @@ const Dashboard: React.FC<DashboardProps> = ({ assets, strategies, marketData, p
               fundingRate,
               ctVal,
               spot: { balance: spotBalance, value: spotValue, pnl: spotPnL },
-              swap: { size: swapSize, entry: swapEntry, upl: swapUPL, leverage: pos.lever },
+              swap: { size: swapSize, coinQty: swapCoinQty, value: swapValue, entry: swapEntry, upl: swapUPL, leverage: pos.lever },
               yield: { daily: dailyYield, netPnL },
               hedge: { deltaAmount, deltaValue, status }
           };
@@ -204,64 +208,86 @@ const Dashboard: React.FC<DashboardProps> = ({ assets, strategies, marketData, p
                                  {item.hedge.status === 'Dusty' && <span className="text-[10px] bg-yellow-500/20 text-yellow-400 px-2 py-0.5 rounded flex items-center gap-1">Dusty</span>}
                                  {item.hedge.status === 'Risk' && <span className="text-[10px] bg-red-500/20 text-red-400 px-2 py-0.5 rounded flex items-center gap-1 animate-pulse"><AlertTriangle className="w-3 h-3"/> Imbalanced</span>}
                              </div>
-                             <div className="flex items-center gap-4">
+                             <div className="flex items-center gap-2">
                                  {item.hedge.status !== 'Perfect' && (
                                      <button 
                                         onClick={() => handleFixHedge(item.pair)}
                                         disabled={fixingId === item.pair}
                                         className="text-[10px] bg-blue-600 hover:bg-blue-500 text-white px-2 py-1 rounded flex items-center gap-1 disabled:opacity-50"
                                      >
-                                         <RefreshCw className={`w-3 h-3 ${fixingId === item.pair ? 'animate-spin' : ''}`} /> Fix Hedge
+                                         <RefreshCw className={`w-3 h-3 ${fixingId === item.pair ? 'animate-spin' : ''}`} /> Auto-Fix
                                      </button>
                                  )}
-                                 <div className="text-right">
-                                     <div className="text-[10px] text-slate-500 uppercase">净值 PnL</div>
-                                     <div className={`font-mono font-bold ${item.yield.netPnL >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                                         {item.yield.netPnL >= 0 ? '+' : ''}{item.yield.netPnL.toFixed(2)} USD
-                                     </div>
-                                 </div>
                              </div>
                         </div>
 
-                        {/* Card Body Grid */}
-                        <div className="grid grid-cols-3 divide-x divide-slate-700/50">
-                             {/* Module 1: Spot */}
-                             <div className="p-4 space-y-3 relative">
-                                <div className="text-xs text-slate-500 font-bold uppercase tracking-wider mb-1 flex items-center gap-1"><Wallet className="w-3 h-3" /> 现货端 (Spot)</div>
-                                <div>
-                                    <div className="text-xs text-slate-400">持仓量</div>
-                                    <div className="text-sm font-mono text-white">{item.spot.balance.toFixed(4)} {item.baseCurrency}</div>
+                        {/* Symmetric Asset-Liability View */}
+                        <div className="grid grid-cols-3 divide-x divide-slate-700/50 bg-slate-800/50">
+                             {/* Left: Spot (Asset/Long) */}
+                             <div className="p-4 space-y-3 border-t-2 border-t-emerald-500/30 bg-emerald-900/5">
+                                <div className="text-xs text-emerald-400 font-bold uppercase tracking-wider mb-2 flex items-center gap-1">
+                                    <Wallet className="w-3 h-3" /> 现货端 (Spot Long)
                                 </div>
-                                <div className={`${item.hedge.status === 'Risk' ? 'text-red-400' : 'text-slate-500'} text-[10px] mt-1`}>
-                                    Delta: {item.hedge.deltaAmount > 0 ? '+' : ''}{item.hedge.deltaAmount.toFixed(4)} ({item.hedge.deltaValue > 0 ? '+' : ''}${item.hedge.deltaValue.toFixed(2)})
+                                <div className="flex justify-between items-end">
+                                    <span className="text-xs text-slate-500">持仓量</span>
+                                    <span className="text-sm font-mono text-white">{item.spot.balance.toFixed(4)} <span className="text-[10px] text-slate-600">{item.baseCurrency}</span></span>
+                                </div>
+                                <div className="flex justify-between items-end">
+                                    <span className="text-xs text-slate-500">持仓价值</span>
+                                    <span className="text-sm font-mono text-white">${item.spot.value.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span>
+                                </div>
+                                <div className="flex justify-between items-end">
+                                    <span className="text-xs text-slate-500">估算盈亏</span>
+                                    <span className={`text-sm font-mono font-bold ${item.spot.pnl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                                        {item.spot.pnl >= 0 ? '+' : ''}{item.spot.pnl.toFixed(2)}
+                                    </span>
                                 </div>
                              </div>
 
-                             {/* Module 2: Swap */}
-                             <div className="p-4 space-y-3">
-                                <div className="text-xs text-slate-500 font-bold uppercase tracking-wider mb-1 flex items-center gap-1"><Scale className="w-3 h-3" /> 合约端 (Swap)</div>
-                                <div>
-                                    <div className="text-xs text-slate-400">合约张数</div>
-                                    <div className="text-sm font-mono text-white">{item.swap.size} <span className="text-[10px] text-slate-500">x {item.ctVal}</span></div>
+                             {/* Middle: Swap (Liability/Short) */}
+                             <div className="p-4 space-y-3 border-t-2 border-t-purple-500/30 bg-purple-900/5">
+                                <div className="text-xs text-purple-400 font-bold uppercase tracking-wider mb-2 flex items-center gap-1">
+                                    <Scale className="w-3 h-3" /> 合约端 (Swap Short)
                                 </div>
-                                <div>
-                                    <div className="text-xs text-slate-400">未实现盈亏 (UPL)</div>
-                                    <div className={`text-sm font-mono font-bold ${item.swap.upl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                                        {item.swap.upl >= 0 ? '+' : ''}{item.swap.upl.toFixed(2)}
+                                <div className="flex justify-between items-end">
+                                    <span className="text-xs text-slate-500">合约张数</span>
+                                    <div className="text-right">
+                                        <div className="text-sm font-mono text-white">-{item.swap.size} <span className="text-[10px] text-slate-600">张</span></div>
+                                        <div className="text-[10px] text-slate-500">≈ {item.swap.coinQty.toFixed(4)} {item.baseCurrency}</div>
                                     </div>
                                 </div>
+                                <div className="flex justify-between items-end">
+                                    <span className="text-xs text-slate-500">名义价值</span>
+                                    <span className="text-sm font-mono text-white">${item.swap.value.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span>
+                                </div>
+                                <div className="flex justify-between items-end">
+                                    <span className="text-xs text-slate-500">未结盈亏</span>
+                                    <span className={`text-sm font-mono font-bold ${item.swap.upl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                                        {item.swap.upl >= 0 ? '+' : ''}{item.swap.upl.toFixed(2)}
+                                    </span>
+                                </div>
                              </div>
 
-                             {/* Module 3: Yield */}
-                             <div className="p-4 space-y-3 bg-slate-800/30">
-                                <div className="text-xs text-slate-500 font-bold uppercase tracking-wider mb-1 flex items-center gap-1"><TrendingUp className="w-3 h-3" /> 收益与风险</div>
-                                <div>
-                                    <div className="text-xs text-slate-400">实时费率</div>
-                                    <div className="text-sm font-mono text-emerald-400 font-bold">{(item.fundingRate * 100).toFixed(4)}%</div>
+                             {/* Right: Net Summary */}
+                             <div className="p-4 space-y-3 border-t-2 border-t-blue-500/30">
+                                <div className="text-xs text-blue-400 font-bold uppercase tracking-wider mb-2 flex items-center gap-1">
+                                    <ArrowRightLeft className="w-3 h-3" /> 收益概览 (Net)
                                 </div>
-                                <div>
-                                    <div className="text-xs text-slate-400">预估日收</div>
-                                    <div className="text-sm font-mono text-emerald-400">+${item.yield.daily.toFixed(2)}</div>
+                                <div className="flex justify-between items-end">
+                                    <span className="text-xs text-slate-500">对冲差额 (Delta)</span>
+                                    <span className={`text-sm font-mono ${item.hedge.status === 'Perfect' ? 'text-slate-500' : 'text-yellow-400'}`}>
+                                        {item.hedge.deltaValue > 0 ? '+' : ''}{item.hedge.deltaValue.toFixed(2)} USD
+                                    </span>
+                                </div>
+                                <div className="flex justify-between items-end">
+                                    <span className="text-xs text-slate-500">资金费率</span>
+                                    <span className="text-sm font-mono text-emerald-400 font-bold">{(item.fundingRate * 100).toFixed(4)}%</span>
+                                </div>
+                                <div className="flex justify-between items-end">
+                                    <span className="text-xs text-slate-500">组合净盈亏</span>
+                                    <span className={`text-lg font-mono font-bold ${item.yield.netPnL >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                                        {item.yield.netPnL >= 0 ? '+' : ''}{item.yield.netPnL.toFixed(2)}
+                                    </span>
                                 </div>
                              </div>
                         </div>

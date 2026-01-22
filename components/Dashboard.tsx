@@ -2,7 +2,7 @@ import React, { useMemo, useState, useEffect } from 'react';
 import { Asset, TickerData, StrategyConfig, Position, OKXConfig, Instrument } from '../types';
 import { okxService } from '../services/okxService';
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as ReTooltip, Cell } from 'recharts';
-import { DollarSign, Clock, Server, Wallet, PieChart, Briefcase, TrendingUp, Scale, RefreshCw, AlertTriangle, CheckCircle, ArrowRightLeft } from 'lucide-react';
+import { DollarSign, Clock, Server, Wallet, PieChart, Briefcase, TrendingUp, Scale, RefreshCw, AlertTriangle, CheckCircle, ArrowRightLeft, Zap, List } from 'lucide-react';
 
 interface DashboardProps {
   assets: Asset[];
@@ -95,9 +95,12 @@ const Dashboard: React.FC<DashboardProps> = ({ assets, strategies, marketData, p
           const spotPnL = (currentPrice - swapEntry) * spotBalance;
           
           // Yield Calculations
-          // Daily Yield = Value * Rate * 3 (8h * 3)
-          const dailyYield = spotValue * Math.abs(fundingRate) * 3;
-          const netPnL = spotPnL + swapUPL;
+          // Next Yield (Next Payout) = Swap Value * Funding Rate (assuming Short & Positive Rate)
+          const nextYield = swapValue * fundingRate;
+          const dailyYield = nextYield * 3;
+          
+          // Price PnL = Spot PnL + Swap UPL
+          const pricePnL = spotPnL + swapUPL;
 
           let status: 'Perfect' | 'Dusty' | 'Risk' = 'Perfect';
           if (Math.abs(deltaValue) > 10) status = 'Risk';
@@ -111,23 +114,31 @@ const Dashboard: React.FC<DashboardProps> = ({ assets, strategies, marketData, p
               ctVal,
               spot: { balance: spotBalance, value: spotValue, pnl: spotPnL },
               swap: { size: swapSize, coinQty: swapCoinQty, value: swapValue, entry: swapEntry, upl: swapUPL, leverage: pos.lever },
-              yield: { daily: dailyYield, netPnL },
+              yield: { daily: dailyYield, next: nextYield, pricePnL: pricePnL },
               hedge: { deltaAmount, deltaValue, status }
           };
       });
   }, [positions, assets, marketData, instruments]);
 
-  const stats = useMemo(() => {
-    let dailyUsd = 0;
+  const globalStats = useMemo(() => {
+    let totalHedgePnL = 0;
+    let totalNextYield = 0;
+    let totalDailyYield = 0;
     let totalValueDeployed = 0;
-    
+
     portfolioItems.forEach(item => {
-        dailyUsd += item.yield.daily;
+        totalHedgePnL += item.yield.pricePnL;
+        totalNextYield += item.yield.next;
+        totalDailyYield += item.yield.daily;
         totalValueDeployed += item.spot.value;
     });
-
+    
+    // Annualized Return based on Total Equity (Capital Efficiency)
+    // APY = (Daily Yield * 365) / Total Equity
+    const apy = totalEquity > 0 ? (totalDailyYield * 365 / totalEquity) * 100 : 0;
     const utilization = totalEquity > 0 ? (totalValueDeployed / totalEquity) * 100 : 0;
-    return { dailyUsd, utilization, totalValueDeployed };
+
+    return { totalHedgePnL, totalNextYield, totalDailyYield, apy, utilization, totalValueDeployed };
   }, [portfolioItems, totalEquity]);
 
   const formatVolume = (volStr: string) => {
@@ -139,10 +150,64 @@ const Dashboard: React.FC<DashboardProps> = ({ assets, strategies, marketData, p
 
   return (
     <div className="space-y-6 animate-fade-in">
-      {/* Top Stats Cards */}
+      {/* Global Yield Header (New Module) */}
+      <div className="bg-gradient-to-r from-slate-900 to-slate-800 p-6 rounded-xl border border-slate-700 shadow-2xl relative overflow-hidden">
+        {/* Visual decoration */}
+        <div className="absolute top-0 right-0 p-4 opacity-5 pointer-events-none">
+            <TrendingUp className="w-48 h-48 text-emerald-500" />
+        </div>
+        
+        <h2 className="text-sm font-bold text-slate-400 uppercase tracking-wider mb-6 flex items-center gap-2">
+            <Zap className="w-4 h-4 text-yellow-400" /> 全局收益监控 (Total Yield Overview)
+        </h2>
+        
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-8 relative z-10">
+            {/* Col 1: Hedge PnL */}
+            <div>
+                <div className="text-xs text-slate-500 mb-1 font-medium uppercase">盘面总浮盈 (Price PnL)</div>
+                <div className={`text-2xl font-mono font-bold ${globalStats.totalHedgePnL >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                    {globalStats.totalHedgePnL >= 0 ? '+' : ''}{globalStats.totalHedgePnL.toFixed(2)}
+                    <span className="text-xs text-slate-500 font-sans ml-1">USD</span>
+                </div>
+                <div className="text-[10px] text-slate-600 mt-1">现货盈亏 + 合约未结</div>
+            </div>
+
+            {/* Col 2: Next Payout */}
+             <div>
+                <div className="text-xs text-slate-500 mb-1 font-medium uppercase">预计下次结算 (Next Payout)</div>
+                <div className={`text-2xl font-mono font-bold ${globalStats.totalNextYield >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                    {globalStats.totalNextYield >= 0 ? '+' : ''}{globalStats.totalNextYield.toFixed(2)}
+                    <span className="text-xs text-slate-500 font-sans ml-1">USD</span>
+                </div>
+                <div className="text-[10px] text-slate-500 mt-1 flex items-center gap-1">
+                   <Clock className="w-3 h-3" /> {nextFundingTime}
+                </div>
+            </div>
+
+            {/* Col 3: Est 24h */}
+             <div>
+                <div className="text-xs text-slate-500 mb-1 font-medium uppercase">日化预估收益 (Est. 24h)</div>
+                <div className={`text-2xl font-mono font-bold ${globalStats.totalDailyYield >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                    {globalStats.totalDailyYield >= 0 ? '+' : ''}{globalStats.totalDailyYield.toFixed(2)}
+                    <span className="text-xs text-slate-500 font-sans ml-1">USD</span>
+                </div>
+                <div className="text-[10px] text-slate-600 mt-1">当前费率 × 3</div>
+            </div>
+
+            {/* Col 4: APY */}
+             <div>
+                <div className="text-xs text-slate-500 mb-1 font-medium uppercase">综合年化 (APY)</div>
+                <div className="text-2xl font-mono font-bold text-blue-400 flex items-baseline">
+                    {globalStats.apy.toFixed(2)}<span className="text-sm ml-1">%</span>
+                </div>
+                <div className="text-[10px] text-slate-600 mt-1">基于总权益计算</div>
+            </div>
+        </div>
+      </div>
+
+      {/* Basic Status Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        <div className="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg relative overflow-hidden group">
-          <div className="absolute top-0 right-0 p-3 opacity-10 group-hover:opacity-20 transition-opacity"><DollarSign className="w-12 h-12 text-white" /></div>
+        <div className="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg relative overflow-hidden">
           <div className="flex flex-col h-full justify-between">
             <div className="text-slate-400 text-sm font-medium flex items-center gap-2"><Wallet className="w-4 h-4" /> 总权益 (Equity)</div>
             <div>
@@ -151,26 +216,20 @@ const Dashboard: React.FC<DashboardProps> = ({ assets, strategies, marketData, p
           </div>
         </div>
         <div className="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg relative overflow-hidden">
-          <div className="flex flex-col h-full justify-between">
-            <div className="text-slate-400 text-sm font-medium flex items-center gap-2"><TrendingUp className="w-4 h-4 text-emerald-400" /> 预估日收 (Est. Daily)</div>
+           <div className="flex flex-col h-full justify-between">
+            <div className="text-slate-400 text-sm font-medium flex items-center gap-2"><PieChart className="w-4 h-4 text-blue-400" /> 资金利用率</div>
             <div>
-                <div className={`text-2xl font-bold mt-2 flex items-baseline gap-2 text-emerald-400`}>
-                  +${stats.dailyUsd.toFixed(2)}
-                  <span className="text-sm text-slate-500 font-normal">/ day</span>
+                <div className="text-2xl font-bold text-white mt-2">{globalStats.utilization.toFixed(1)}%</div>
+                <div className="w-full bg-slate-700 h-1 rounded-full mt-2 overflow-hidden">
+                  <div className="bg-blue-500 h-full transition-all duration-500" style={{ width: `${Math.min(globalStats.utilization, 100)}%` }} />
                 </div>
-                <div className="flex items-center mt-1 text-xs text-slate-400"><Clock className="w-3 h-3 mr-1" /> 下次结算: <span className="text-white ml-1">{nextFundingTime}</span></div>
             </div>
           </div>
         </div>
         <div className="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg">
-           <div className="flex flex-col h-full justify-between">
-            <div className="text-slate-400 text-sm font-medium flex items-center gap-2"><PieChart className="w-4 h-4 text-blue-400" /> 资金利用率</div>
-            <div>
-                <div className="text-2xl font-bold text-white mt-2">{stats.utilization.toFixed(1)}%</div>
-                <div className="w-full bg-slate-700 h-1 rounded-full mt-2 overflow-hidden">
-                  <div className="bg-blue-500 h-full transition-all duration-500" style={{ width: `${Math.min(stats.utilization, 100)}%` }} />
-                </div>
-            </div>
+          <div className="flex flex-col h-full justify-between">
+             <div className="text-slate-400 text-sm font-medium flex items-center gap-2"><Briefcase className="w-4 h-4 text-emerald-400" /> 活跃策略组合</div>
+             <div className="text-2xl font-bold text-white mt-2">{portfolioItems.length}</div>
           </div>
         </div>
         <div className="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg">
@@ -188,8 +247,7 @@ const Dashboard: React.FC<DashboardProps> = ({ assets, strategies, marketData, p
          {/* Portfolio Monitor */}
          <div className="lg:col-span-2 space-y-4">
             <div className="flex justify-between items-center mb-2">
-                <h3 className="font-semibold text-white flex items-center gap-2"><Briefcase className="w-5 h-5 text-blue-400" /> 套利组合监控 (Portfolio)</h3>
-                <span className="text-xs text-slate-500">活跃组合: {portfolioItems.length}</span>
+                <h3 className="font-semibold text-white flex items-center gap-2"><List className="w-5 h-5 text-blue-400" /> 组合详情 (Details)</h3>
             </div>
             
             <div className="grid grid-cols-1 gap-4">
@@ -271,22 +329,41 @@ const Dashboard: React.FC<DashboardProps> = ({ assets, strategies, marketData, p
                              {/* Right: Net Summary */}
                              <div className="p-4 space-y-3 border-t-2 border-t-blue-500/30">
                                 <div className="text-xs text-blue-400 font-bold uppercase tracking-wider mb-2 flex items-center gap-1">
-                                    <ArrowRightLeft className="w-3 h-3" /> 收益概览 (Net)
+                                    <ArrowRightLeft className="w-3 h-3" /> 收益详解 (Yield Detail)
                                 </div>
+                                
                                 <div className="flex justify-between items-end">
                                     <span className="text-xs text-slate-500">对冲差额 (Delta)</span>
                                     <span className={`text-sm font-mono ${item.hedge.status === 'Perfect' ? 'text-slate-500' : 'text-yellow-400'}`}>
-                                        {item.hedge.deltaValue > 0 ? '+' : ''}{item.hedge.deltaValue.toFixed(2)} USD
+                                        {item.hedge.deltaValue > 0 ? '+' : ''}{item.hedge.deltaValue.toFixed(2)}
                                     </span>
                                 </div>
+
+                                <div className="flex justify-between items-end">
+                                    <span className="text-xs text-slate-500">盘面浮盈 (PnL)</span>
+                                    <span className={`text-sm font-mono font-bold ${item.yield.pricePnL >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                                        {item.yield.pricePnL >= 0 ? '+' : ''}{item.yield.pricePnL.toFixed(2)}
+                                    </span>
+                                </div>
+
+                                <div className="h-px bg-slate-700/50 my-1"></div>
+
                                 <div className="flex justify-between items-end">
                                     <span className="text-xs text-slate-500">资金费率</span>
-                                    <span className="text-sm font-mono text-emerald-400 font-bold">{(item.fundingRate * 100).toFixed(4)}%</span>
+                                    <span className="text-sm font-mono text-white font-bold">{(item.fundingRate * 100).toFixed(4)}%</span>
                                 </div>
+
+                                <div className="flex justify-between items-end bg-emerald-500/10 p-1 -mx-1 rounded">
+                                    <span className="text-xs text-emerald-400 font-medium">下次收益 (Next)</span>
+                                    <span className="text-sm font-mono text-emerald-400 font-bold">
+                                        +{item.yield.next.toFixed(2)}
+                                    </span>
+                                </div>
+
                                 <div className="flex justify-between items-end">
-                                    <span className="text-xs text-slate-500">组合净盈亏</span>
-                                    <span className={`text-lg font-mono font-bold ${item.yield.netPnL >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                                        {item.yield.netPnL >= 0 ? '+' : ''}{item.yield.netPnL.toFixed(2)}
+                                    <span className="text-xs text-slate-500">日化预估 (24h)</span>
+                                    <span className="text-sm font-mono text-emerald-500">
+                                        +{item.yield.daily.toFixed(2)}
                                     </span>
                                 </div>
                              </div>
